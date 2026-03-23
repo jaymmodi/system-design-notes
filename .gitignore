@@ -1,0 +1,42 @@
+# Editor & IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+.env.local
+.env.*.local
+
+# Build & Dependencies
+node_modules/
+dist/
+build/
+.cache/
+*.egg-info/
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+
+# Temporary
+temp/
+tmp/
+*.tmp
+
+# Generated files
+.generated/
+auto-generated/
+
+# Project specific
+.project-backup/
