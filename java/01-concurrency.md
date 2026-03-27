@@ -1078,4 +1078,148 @@ Blocking I/O at high concurrency       → Virtual Threads
 CPU parallel computation               → ForkJoinPool / parallel streams
 Per-thread state (thread pool)         → ThreadLocal (+ remove in finally)
 Per-thread state (virtual threads)     → ScopedValue
+Fan-out + collect results + fail-fast  → StructuredTaskScope
+Fire-and-forget / long-lived pool      → ExecutorService
+Producer-consumer with backpressure    → ArrayBlockingQueue + Virtual Threads
 ```
+
+---
+
+## Producer-Consumer with Virtual Threads
+
+### ArrayBlockingQueue vs LinkedBlockingQueue
+
+| | ArrayBlockingQueue | LinkedBlockingQueue |
+|---|---|---|
+| **Backing store** | Single array, pre-allocated | Node per element, heap-allocated |
+| **Lock** | One lock (shared put/take) | Two locks (separate put/take) |
+| **Capacity** | Always bounded (required) | Optional bound (default `Integer.MAX_VALUE`) |
+| **Memory** | Fixed, predictable | Grows with queue size + GC pressure |
+| **Throughput** | Lower under high contention | Higher when producers/consumers rarely collide |
+| **Latency** | More predictable | Varies (GC pauses from node allocation) |
+
+**Default choice: `ArrayBlockingQueue` with an explicit bound.**
+Switch to `LinkedBlockingQueue` only after profiling shows single-lock contention is a real bottleneck.
+
+### The Bound
+
+The bound is the maximum number of items the queue can hold. When full, `put()` blocks the producer — this is backpressure.
+
+```
+Rule of thumb: bound = consumer throughput × acceptable latency
+
+Consumer processes 1,000 items/sec, OK with 2 sec of queued work
+→ bound = 1,000 × 2 = 2,000
+```
+
+Too small → producer blocks too often, CPU idle
+Too large → too much work queued, high latency, more memory
+
+### Full Example — Poison Pill Shutdown
+
+```java
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class ProducerConsumer {
+
+    record Task(int id, String data) {}
+
+    static final int QUEUE_BOUND        = 100;
+    static final int NUM_PRODUCERS      = 2;
+    static final int NUM_CONSUMERS      = 4;
+    static final int TASKS_PER_PRODUCER = 10;
+
+    // Poison pill — signals consumers to stop
+    static final Task POISON = new Task(-1, "STOP");
+
+    public static void main(String[] args) throws InterruptedException {
+
+        BlockingQueue<Task> queue = new ArrayBlockingQueue<>(QUEUE_BOUND);
+        AtomicInteger produced = new AtomicInteger(0);
+        AtomicInteger consumed = new AtomicInteger(0);
+        CountDownLatch producersDone = new CountDownLatch(NUM_PRODUCERS);
+
+        // --- Producers ---
+        for (int p = 0; p < NUM_PRODUCERS; p++) {
+            int producerId = p;
+            Thread.ofVirtual().name("producer-" + p).start(() -> {
+                try {
+                    for (int i = 0; i < TASKS_PER_PRODUCER; i++) {
+                        Task task = new Task(produced.incrementAndGet(), "data-from-producer-" + producerId);
+                        queue.put(task);   // blocks if queue is full
+                        System.out.printf("[%s] produced task %d%n",
+                                Thread.currentThread().getName(), task.id());
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    producersDone.countDown();
+                }
+            });
+        }
+
+        // --- Poison pill dispatcher ---
+        // Sends one POISON per consumer after all producers finish
+        Thread.ofVirtual().name("dispatcher").start(() -> {
+            try {
+                producersDone.await();   // wait for all producers to finish
+                for (int i = 0; i < NUM_CONSUMERS; i++) {
+                    queue.put(POISON);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+
+        // --- Consumers ---
+        CountDownLatch allDone = new CountDownLatch(NUM_CONSUMERS);
+
+        for (int c = 0; c < NUM_CONSUMERS; c++) {
+            Thread.ofVirtual().name("consumer-" + c).start(() -> {
+                try {
+                    while (true) {
+                        Task task = queue.take();  // blocks if queue is empty
+
+                        if (task == POISON) {      // reference equality — intentional
+                            System.out.printf("[%s] received poison pill, stopping%n",
+                                    Thread.currentThread().getName());
+                            break;
+                        }
+
+                        process(task);
+                        consumed.incrementAndGet();
+                        System.out.printf("[%s] consumed task %d%n",
+                                Thread.currentThread().getName(), task.id());
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    allDone.countDown();
+                }
+            });
+        }
+
+        allDone.await();  // main thread waits for all consumers to finish
+        System.out.printf("%nDone. Produced: %d  Consumed: %d%n",
+                produced.get(), consumed.get());
+    }
+
+    static void process(Task task) throws InterruptedException {
+        Thread.sleep(10); // simulate work
+    }
+}
+```
+
+### Key Design Decisions
+
+**One POISON pill per consumer** — each consumer needs its own pill; once taken it's gone:
+```
+queue: [POISON][POISON][POISON][POISON]  ← one per consumer
+```
+
+**`==` not `.equals()` for poison check** — reference equality avoids accidentally matching a real task.
+
+**`put()`/`take()` are virtual-thread friendly** — they block the virtual thread, not the carrier thread, so no OS threads are wasted waiting.
+
+**`CountDownLatch` for producer coordination** — use `producersDone.countDown()` in each producer's `finally` block so the dispatcher sends poison pills exactly when all producers are done.
