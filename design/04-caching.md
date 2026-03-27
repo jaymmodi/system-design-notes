@@ -16,6 +16,80 @@ Storing the result of expensive computations or frequent reads in fast storage (
 
 ## Cache Strategies (Write Policies)
 
+### Strategy Diagrams
+
+#### 1. Cache-Aside (Lazy Loading)
+```
+READ path:
+  Client ──→ App ──→ Cache
+                      │ HIT → return data ──→ Client
+                      │ MISS
+                      ↓
+                     DB ──→ App ──writes──→ Cache ──→ Client
+
+WRITE path:
+  Client ──→ App ──→ DB (write)
+                  └──→ Cache.delete(key)   ← invalidate, not update
+```
+
+#### 2. Write-Through
+```
+READ path:
+  Client ──→ App ──→ Cache
+                      │ HIT → return ──→ Client
+                      │ MISS
+                      ↓
+                     DB ──→ App ──writes──→ Cache ──→ Client
+
+WRITE path:
+  Client ──→ App ──→ Cache (sync write)
+                  └──→ DB    (sync write)
+                  both must succeed — if DB fails, rollback cache
+```
+
+#### 3. Write-Behind (Write-Back)
+```
+READ path: same as cache-aside
+
+WRITE path:
+  Client ──→ App ──→ Cache (sync, instant ACK to client)
+                      │
+                  [write queue]
+                      │ async, batched
+                      ↓
+                     DB
+
+  ⚠ if cache crashes before flush → data lost
+```
+
+#### 4. Read-Through
+```
+READ path:
+  Client ──→ App ──→ Cache
+                      │ HIT → return ──→ Client
+                      │ MISS — cache itself fetches from DB
+                      ↓
+                     DB ──→ Cache (populates itself) ──→ Client
+
+  App never talks to DB directly — cache is the only interface
+```
+
+#### Strategy Comparison
+```
+                    Cache-Aside   Write-Through  Write-Behind  Read-Through
+─────────────────────────────────────────────────────────────────────────
+Who fetches DB?      App           App            App           Cache
+Write latency        Fast          Slow (2 writes) Fastest      Fast
+Read latency         Miss on cold  Miss on cold    Miss on cold  Miss on cold
+Stale data risk      Yes (window)  No             Yes (crash)   Low
+Data loss risk       No            No             Yes           No
+Cache fills with     Hot data      All written     All written   Hot data
+Best for             General       Read-after-     High write    Library/
+                                   write consistency throughput  framework
+```
+
+---
+
 ### 1. Cache-Aside (Lazy Loading) — Most Common
 Application manages cache explicitly. Cache only contains data that's been requested.
 
@@ -349,6 +423,116 @@ double avgLoadPenalty = stats.averageLoadPenalty(); // time to load on miss
 - Data that must always be fresh (financial balances — use strong consistency instead)
 - Small datasets that fit in DB memory anyway
 - When consistency is critical and eventual consistency is unacceptable
+
+---
+
+## Redis vs Memcached
+
+### At a glance
+
+| | Redis | Memcached |
+|---|---|---|
+| **Data structures** | String, Hash, List, Set, ZSet, Bitmap, HLL, Stream | String only (key → blob) |
+| **Persistence** | RDB snapshots + AOF log | None — memory only |
+| **Replication** | Primary/replica + Redis Cluster | No built-in replication |
+| **Clustering** | Redis Cluster (hash slots, automatic sharding) | Client-side sharding only |
+| **Pub/Sub** | Yes | No |
+| **Lua scripting** | Yes (atomic multi-op) | No |
+| **Transactions** | MULTI/EXEC + WATCH | No |
+| **TTL** | Per-key TTL | Per-key TTL |
+| **Memory efficiency** | Slightly higher overhead per key | More memory-efficient for pure strings |
+| **Throughput** | ~100K–1M ops/sec | ~100K–1M ops/sec (slightly faster for GET/SET) |
+| **Multithreading** | Single-threaded commands (I/O multithreaded since 6.0) | Fully multithreaded |
+| **Max value size** | 512 MB | 1 MB |
+
+---
+
+### Architecture difference
+
+```
+Redis (single-threaded command execution):
+  Network I/O thread ──→ Command queue ──→ Single worker thread ──→ Memory
+                                                   ↑
+                              no locking needed — one thread owns all data
+                              → atomic by design
+
+Memcached (multithreaded):
+  Thread 1 ──→ Slab allocator ──→ Memory
+  Thread 2 ──→ Slab allocator ──→ Memory   ← threads compete, fine-grained locking
+  Thread 3 ──→ Slab allocator ──→ Memory
+  → better CPU utilization on multi-core for pure GET/SET
+```
+
+### When Redis wins
+
+**Any time you need more than a simple string cache:**
+
+```
+Leaderboard          → ZADD / ZRANGE (Sorted Set)
+Rate limiting        → INCR + EXPIRE, or sliding window with ZSET
+Session store        → HSET (hash per session, field per attribute)
+Pub/Sub messaging    → PUBLISH / SUBSCRIBE
+Distributed lock     → SET NX EX + Lua script
+Counting uniques     → PFADD / PFCOUNT (HyperLogLog)
+Stream processing    → XADD / XREADGROUP
+Bloom filter         → SETBIT / GETBIT (or RedisBloom module)
+Persistence needed   → RDB + AOF
+```
+
+### When Memcached wins
+
+Narrow case — **pure caching of serialized blobs** with high QPS and many CPU cores:
+
+```
+Use case: Cache rendered HTML pages, serialized JSON responses
+  - Every value is the same type (bytes)
+  - No need for data structures
+  - High write rate, many cores available
+  - Memory efficiency matters more than features
+
+Memcached slab allocator is more memory-efficient for uniform value sizes
+Memcached multithreading utilizes all cores — Redis saturates one core at ~1M QPS
+```
+
+### Netflix's choice
+
+Netflix uses **EVCache** — which is built on **Memcached**, not Redis:
+
+```
+Why EVCache uses Memcached:
+  - Netflix caches are simple blobs (serialized Thrift/Protobuf objects)
+  - Massive scale: millions of cache nodes, trillions of ops/day
+  - Memory efficiency at that scale matters — Memcached wins on pure GET/SET
+  - Replication handled by EVCache layer on top, not Memcached itself
+  - No need for data structures — app logic handles everything
+
+Why Netflix also uses Redis:
+  - Rate limiting
+  - Distributed locks
+  - Real-time leaderboards / sorted data
+  - Pub/Sub within services
+```
+
+### Real-world decision tree
+
+```
+Need persistence or replication?          → Redis
+Need Pub/Sub or Streams?                  → Redis
+Need data structures (ZSet, Hash, etc)?   → Redis
+Need distributed lock?                    → Redis
+Need Lua atomicity?                       → Redis
+
+Pure blob cache, huge scale, many cores?  → Memcached
+Already using EVCache / Netflix stack?    → Memcached
+
+Default for new projects?                 → Redis
+  (more features, better ops tooling,
+   persistence safety net, active community)
+```
+
+### One-liner for interviews
+
+> "Memcached is faster for pure GET/SET at scale due to multithreading and simpler memory model. Redis wins everything else — data structures, persistence, pub/sub, cluster replication, atomic Lua scripts. Default to Redis; use Memcached only when you've profiled that Redis is your bottleneck and your access pattern is purely key-value blobs. Netflix uses both — EVCache (Memcached-based) for object caching at massive scale, Redis for rate limiting, locks, and sorted data."
 
 ---
 
