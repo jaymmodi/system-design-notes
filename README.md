@@ -1,6 +1,6 @@
-# System Design Interview Prep — Netflix L5
+# System Design Notes
 
-> Target: Distributed Systems Engineer, Data Platform — Apr 8–9, 2026
+Personal reference notes on distributed systems, data structures, and Java internals.
 
 ---
 
@@ -8,14 +8,7 @@
 
 ```
 system-design-notes/
-├── README.md                         — this file
-├── STUDY-PLAN.md                     — 18-day day-by-day sprint
-├── CONCURRENCY-CODING-PRACTICE.md    — Java implementations to write cold
-├── REVERSE-DESIGN-NARRATIVE.md       — scripted GuardDuty story for Infrastructure-DSI
-├── RESUME-ANALYSIS.md                — strengths, gaps, STAR stories, positioning
-├── NETFLIX-INTERVIEW-GUIDE.md        — process, rounds, what each round tests
-├── NETFLIX-JOB-ANALYSIS.md           — JD breakdown, team analysis, questions to ask
-├── NETFLIX-POPULAR-QUESTIONS.md      — sourced questions from Glassdoor/Blind/LeetCode
+├── README.md
 │
 ├── design/                           — distributed systems & architecture topics
 │   ├── 01-scalability-fundamentals.md
@@ -44,7 +37,7 @@ system-design-notes/
 │   ├── 26-netflix-data-platform.md
 │   ├── 27-infrastructure-k8s.md
 │   ├── 28-java-sizes-boe.md          — primitive/object/collection sizes for back-of-envelope
-│   └── 29-system-design-questions.md — top interview questions with thought process + solutions
+│   └── 29-system-design-questions.md — common design questions with thought process + solutions
 │
 ├── data-structures/                  — internals: how storage engines work
 │   ├── 08-bloom-filters.md
@@ -56,56 +49,33 @@ system-design-notes/
 │
 └── java/                             — Java language deep dives
     ├── 01-concurrency.md             — CountDownLatch, CyclicBarrier, Semaphore, ExecutorService, Virtual Threads, CompletableFuture
-    ├── 02-message-brokers.md         — Redis Streams vs Kafka vs Kinesis vs SQS: mental models, when to use which, Netflix angle
+    ├── 02-message-brokers.md         — Redis Streams vs Kafka vs Kinesis vs SQS: mental models, when to use which
     └── 03-redis-commands-cheatsheet.md — all Redis commands by type: strings, hashes, sets, ZSETs, streams, bitmaps, HLL, Lua
 ```
 
 ---
 
-## Start Here
+## Design Topics
 
-| What you need | File |
-|---------------|------|
-| What to study each day | `STUDY-PLAN.md` |
-| Concurrency code to practice | `CONCURRENCY-CODING-PRACTICE.md` |
-| Your GuardDuty story (Infrastructure-DSI) | `REVERSE-DESIGN-NARRATIVE.md` |
-| STAR stories + positioning statement | `RESUME-ANALYSIS.md` |
-| Questions to ask Netflix | `NETFLIX-JOB-ANALYSIS.md` |
-
----
-
-## Files by Interview Round
-
-| Round | Primary Files |
-|-------|--------------|
-| **Problem Solving** (Apr 8, 9am) | `CONCURRENCY-CODING-PRACTICE.md` |
-| **Infrastructure-DSI** (Apr 8, 10:30am) | `REVERSE-DESIGN-NARRATIVE.md`, `RESUME-ANALYSIS.md` |
-| **Distributed Systems Design** (Apr 9, 9am) | `design/02-cap-theorem.md`, `design/03-consistent-hashing.md`, `design/07-replication.md`, `design/23-stream-processing.md`, `design/25-apache-iceberg-data-lake.md`, `design/26-netflix-data-platform.md` |
-| **Operations & Reliability** (Apr 9, 11am) | `design/24-observability-operations.md`, `design/17-circuit-breaker.md`, `RESUME-ANALYSIS.md` |
+| Priority | File | Topic |
+|----------|------|-------|
+| Core | `design/02-cap-theorem.md` | Consistency vs availability tradeoffs |
+| Core | `design/03-consistent-hashing.md` | Sharding, KV stores, Kafka partitioning |
+| Core | `design/23-stream-processing.md` | Kafka, Flink, exactly-once semantics |
+| Core | `design/04-caching.md` | Cache strategies, Redis vs Memcached, EVCache |
+| Core | `design/15-quorum-and-consensus.md` | Replication, consistency models |
+| Core | `design/20-distributed-transactions.md` | Saga, 2PC, workflow orchestration |
+| Deep | `design/25-apache-iceberg-data-lake.md` | Table format, ACID on object storage |
+| Deep | `design/26-netflix-data-platform.md` | Kafka, Flink, Iceberg, EVCache, Maestro |
+| Deep | `design/22-leases.md` | Partition ownership, fencing tokens |
+| Supporting | `design/07-replication.md` | Leader-follower vs leaderless |
+| Supporting | `design/27-infrastructure-k8s.md` | Kubernetes, service mesh |
 
 ---
 
-## Design Topics — Priority for Your Role
+## Data Structures
 
-| Priority | File | Why |
-|----------|------|-----|
-| 🔴 Must | `design/02-cap-theorem.md` | Every design question probes this |
-| 🔴 Must | `design/03-consistent-hashing.md` | Core to KV store, caching, Kafka |
-| 🔴 Must | `design/23-stream-processing.md` | Flink, Kafka, exactly-once |
-| 🔴 Must | `design/25-apache-iceberg-data-lake.md` | Netflix's table format |
-| 🔴 Must | `design/26-netflix-data-platform.md` | Netflix vocabulary |
-| 🟡 High | `design/04-caching.md` + `design/10-redis.md` | EVCache / caching team |
-| 🟡 High | `design/22-leases.md` | Partition ownership, fencing tokens |
-| 🟡 High | `design/15-quorum-and-consensus.md` | Replication, consistency models |
-| 🟡 High | `design/20-distributed-transactions.md` | Saga, 2PC, workflow orchestration |
-| 🟢 Medium | `design/27-infrastructure-k8s.md` | ECS → K8s bridge |
-| 🟢 Medium | `design/07-replication.md` | Leader-follower vs leaderless |
-
----
-
-## Data Structures — Bonus Depth (Not Primary)
-
-Know these well enough to **explain and compare** — you won't implement them from scratch:
+Know well enough to explain and compare:
 
 | File | When It Comes Up |
 |------|-----------------|
@@ -136,3 +106,4 @@ Know these well enough to **explain and compare** — you won't implement them f
 | Distributed coordination | ZooKeeper / etcd |
 | Handle partial failures | Circuit Breaker (Hystrix) |
 | Partition ownership | Leases + fencing tokens |
+| Producer-consumer backpressure | ArrayBlockingQueue + Virtual Threads |
