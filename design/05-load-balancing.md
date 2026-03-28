@@ -373,9 +373,248 @@ public class OrderService {
 
 ---
 
+## Stateful Connections — WebSockets and Streaming
+
+### Why stateful is hard for load balancers
+
+HTTP is stateless — each request is independent, any server can handle it. WebSockets and streaming are different:
+
+```
+HTTP (stateless):
+  Request 1 → Server A
+  Request 2 → Server B   ← fine, no state shared
+  Request 3 → Server A
+
+WebSocket (stateful):
+  CONNECT → Server A     ← TCP connection established, state lives here
+  message → Server A     ← MUST go to same server (same TCP connection)
+  message → Server A     ← ALB can't route this mid-connection
+  message → Server B     ← ✗ BROKEN — different TCP connection entirely
+```
+
+Once a WebSocket handshake completes, **all frames on that connection go to the same backend**. The LB can't move it. The challenge is: what happens when that backend goes down?
+
+---
+
+### Netflix Streaming Architecture on AWS
+
+Netflix video streaming is a long-lived stateful connection — a 2-hour movie = 2-hour open connection. Here's how they build it:
+
+```
+                        Route 53 (GeoDNS)
+                             │
+                    ┌────────┴─────────┐
+                    │                  │
+              us-east-1            eu-west-1
+                    │
+             AWS Global Accelerator   ← anycast IPs, routes to nearest edge
+                    │
+              NLB (Layer 4)           ← TCP passthrough, preserves client IP
+                    │                    ultra-low latency, handles millions of
+                    │                    concurrent TCP connections
+              ┌─────┴──────┐
+         AZ-1a             AZ-1b
+              │                │
+        [Streaming Server] [Streaming Server]
+              │
+        [Chunk Server / CDN Origin]
+```
+
+**Why NLB not ALB for streaming?**
+```
+ALB terminates TLS, parses HTTP — adds ~1ms overhead, fine for APIs
+NLB passes raw TCP through — sub-millisecond, scales to millions of connections
+Video chunks are large binary blobs — no HTTP routing logic needed
+NLB preserves real client IP natively — no X-Forwarded-For needed
+```
+
+---
+
+### WebSocket on AWS — ALB + Sticky Sessions
+
+For interactive apps (chat, live notifications, collaborative editing):
+
+```
+Client
+  │  HTTP Upgrade: websocket
+  ↓
+ALB  (Layer 7 — understands WebSocket upgrade)
+  │  ALB detects Upgrade header → switches to TCP passthrough mode
+  │  Sticky session cookie set on initial HTTP handshake
+  ↓
+Target Group (EC2 / ECS)
+  ├── ws-server-1  ← client pinned here via stickiness cookie
+  ├── ws-server-2
+  └── ws-server-3
+```
+
+ALB stickiness config:
+```
+Target Group → Attributes:
+  Stickiness type:     load balancer generated cookie
+  Stickiness duration: 1 day (longer than expected session)
+  Cookie name:         AWSALB
+```
+
+What happens in practice:
+```
+1. Client opens WebSocket → ALB picks ws-server-1, sets AWSALB cookie
+2. All subsequent frames on that TCP connection → ws-server-1 automatically
+   (same TCP connection, ALB just forwards)
+3. Connection drops → client reconnects with AWSALB cookie → ALB routes to ws-server-1 again
+4. ws-server-1 is unhealthy → ALB routes to new server → client must re-establish app state
+```
+
+---
+
+### The Real Problem — State on the Backend
+
+Stickiness solves routing but creates a new problem: **what does the backend server store?**
+
+#### Bad pattern — state in server memory
+```
+ws-server-1 memory:
+  userId:123 → {subscriptions: [room:A, room:B], lastSeen: ...}
+
+ws-server-1 crashes:
+  All state for 10,000 connected clients → gone
+  Clients reconnect → ws-server-2 has no idea about their subscriptions
+```
+
+#### Good pattern — externalize session state to Redis
+
+```
+Client ──WebSocket──→ ws-server-1
+                           │
+                    on connect: load state from Redis
+                    on message: update state in Redis
+                    on disconnect: state persists in Redis
+                           │
+                        Redis
+                    userId:123 → {subscriptions, cursor, presence}
+
+Client reconnects → ws-server-2:
+  load state from Redis → seamless, no lost state
+  ws-server-1 failure → transparent to client
+```
+
+```java
+// WebSocket handler — stateless server, stateful Redis
+@ServerEndpoint("/ws/{userId}")
+public class StreamingHandler {
+
+    @OnOpen
+    public void onOpen(Session session, @PathParam("userId") String userId) {
+        // Load state from Redis — server holds no state itself
+        UserSession state = redis.get("session:" + userId, UserSession.class);
+        session.getUserProperties().put("state", state);
+        subscriptionManager.subscribe(userId, session);
+    }
+
+    @OnMessage
+    public void onMessage(String message, Session session) {
+        UserSession state = (UserSession) session.getUserProperties().get("state");
+        state.update(message);
+        redis.set("session:" + state.userId(), state);   // persist immediately
+    }
+
+    @OnClose
+    public void onClose(Session session) {
+        // State survives in Redis — client can reconnect to any server
+        subscriptionManager.unsubscribe(session);
+    }
+}
+```
+
+---
+
+### Netflix-specific: how video chunk delivery avoids stateful LB entirely
+
+Netflix sidesteps the stateful problem by making streaming **mostly stateless at the delivery layer**:
+
+```
+Client player:
+  1. Calls playback API → gets manifest (list of chunk URLs)
+  2. Each chunk URL points directly to CDN (Open Connect Appliance)
+  3. Downloads chunks independently — each is a stateless HTTP GET
+  4. ABR (Adaptive Bitrate) logic runs on client — picks quality per chunk
+
+LB only handles:
+  - Playback API calls (stateless, short-lived)
+  - License/DRM requests (stateless)
+  - CDN origin fetch (stateless)
+
+Result: ALB works fine — no sticky sessions needed for the hot path
+```
+
+```
+Client
+  │ POST /api/v1/playback  (which streams are available, which CDN node)
+  ↓
+ALB → Playback API (stateless, any server)
+  │
+  └── returns: manifest with 200 chunk URLs pointing to cdn.netflix.com
+
+Client
+  │ GET cdn.netflix.com/chunk_001.ts  (stateless, pure HTTP)
+  │ GET cdn.netflix.com/chunk_002.ts
+  │ GET cdn.netflix.com/chunk_003.ts  ...
+  ↓
+Open Connect CDN (Netflix's own CDN, co-located at ISPs)
+```
+
+---
+
+### AWS Architecture Summary — Stateless vs Stateful
+
+```
+                    ┌─────────────────────────────────────┐
+                    │           Route 53 (GeoDNS)          │
+                    └──────────────┬──────────────────────┘
+                                   │
+              ┌────────────────────┼───────────────────────┐
+              │                    │                        │
+    ┌─────────▼────────┐  ┌────────▼───────┐   ┌──────────▼──────────┐
+    │  ALB (L7)        │  │  NLB (L4)      │   │  CloudFront (CDN)   │
+    │  REST APIs       │  │  WebSocket     │   │  Video chunks       │
+    │  Stateless       │  │  Streaming     │   │  Static assets      │
+    │  Round-robin     │  │  TCP passthru  │   │  Edge-cached        │
+    └─────────┬────────┘  └────────┬───────┘   └─────────────────────┘
+              │                    │
+    ┌─────────▼────────┐  ┌────────▼───────┐
+    │  API Servers     │  │  WS Servers    │
+    │  Stateless       │  │  Stateless     │
+    │  ASG 2-50        │  │  ASG 2-20      │
+    └──────────────────┘  └────────┬───────┘
+                                   │
+                            ┌──────▼──────┐
+                            │    Redis    │  ← session state, subscriptions
+                            │  ElastiCache│     presence, cursors
+                            └─────────────┘
+```
+
+---
+
+### When to use NLB vs ALB for stateful workloads
+
+| | ALB | NLB |
+|---|---|---|
+| **WebSocket** | ✓ (understands Upgrade header) | ✓ (TCP passthrough) |
+| **Video streaming** | ✗ (overhead, 1MB max body parsing) | ✓ (raw TCP, no overhead) |
+| **Sticky sessions** | ✓ cookie-based | ✓ source IP-based |
+| **TLS termination** | ✓ | ✓ (TLS passthrough or terminate) |
+| **Health checks** | HTTP /health | TCP or HTTP |
+| **Static IP** | ✗ (DNS only) | ✓ (Elastic IP per AZ) |
+| **Millions of concurrent connections** | ✗ (L7 parsing overhead) | ✓ (designed for this) |
+| **Use when** | HTTP apps, WebSocket chat | Raw TCP, streaming, gaming, IoT |
+
+---
+
 ## Interview Questions
 
 1. **How does a load balancer differ from an API gateway?** LB: routes traffic, health checks. API GW: auth, rate limiting, transformation, routing — LB is a subset
 2. **How do you handle session persistence?** Sticky sessions (IP hash), or better: move session to shared store (Redis) → any server can handle any request
 3. **What happens when a load balancer itself is a SPOF?** Use active-active or active-passive pair, virtual IPs (Keepalived/VRRP)
-4. **How does AWS ALB differ from NLB?** ALB = L7 (HTTP/HTTPS, content-based routing), NLB = L4 (TCP/UDP, ultra-low latency)
+4. **How does AWS ALB differ from NLB?** ALB = L7 (HTTP/HTTPS, content-based routing), NLB = L4 (TCP/UDP, ultra-low latency, millions of connections)
+5. **How would you design WebSocket infrastructure for 1M concurrent connections?** NLB → stateless WS servers → externalize all state to Redis. Stickiness is a routing convenience, not a requirement when state is in Redis.
+6. **How does Netflix avoid stateful LB for video streaming?** Playback API returns chunk URLs pointing directly to CDN. Each chunk is a stateless GET — no sticky sessions needed on the hot path.
