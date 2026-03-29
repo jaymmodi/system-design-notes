@@ -390,9 +390,202 @@ DynamoDB partition (one shard of your table):
 
 ---
 
+## Cassandra Replication — Deep Dive
+
+### The Ring — how data is distributed
+
+Every Cassandra node owns a range of tokens on a consistent hash ring. The partition key is hashed → maps to a position on the ring → goes to the node that owns that token range.
+
+```
+Token ring (0 to 2^64):
+
+        Node A (owns 0–25%)
+              │
+    ┌─────────┴─────────┐
+    │                   │
+Node D              Node B
+(75–100%)           (25–50%)
+    │                   │
+    └─────────┬─────────┘
+              │
+        Node C (owns 50–75%)
+
+write("user:123") → hash = 38% → Node B owns this range → Node B is the first replica
+```
+
+### Replication Factor — how many copies
+
+RF=3 means 3 nodes store each row. Cassandra walks clockwise around the ring:
+
+```
+RF=3, write("user:123") → hash lands on Node B
+
+  Replica 1: Node B  (primary)
+  Replica 2: Node C  (next clockwise)
+  Replica 3: Node D  (next clockwise)
+  Node A:    no copy for this row
+```
+
+### Coordinator Node — who handles the request
+
+Client writes to one node (coordinator). Coordinator fans out to all replicas.
+
+```
+Client
+  │  write("user:123", data)
+  ↓
+Node A  ← coordinator (any node — doesn't hold this data)
+  │
+  ├──→ Node B  (replica 1) ──→ ack
+  ├──→ Node C  (replica 2) ──→ ack
+  └──→ Node D  (replica 3) ──→ ack
+
+Coordinator waits for W acks (W = consistency level)
+W=QUORUM (2 of 3) → returns success after 2 acks, Node D's ack arrives later
+```
+
+**Any node can be coordinator** — no designated leader per partition. This is why Cassandra is truly leaderless.
+
+### Consistency Levels — tunable W and R
+
+```
+N=3 (replication factor)
+
+Write levels:
+  ONE          → wait for 1 ack          (fastest, least safe)
+  QUORUM       → wait for 2 of 3 acks    (balanced)
+  LOCAL_QUORUM → quorum within local DC  ← Netflix uses this
+  ALL          → wait for all 3 acks     (slowest, safest)
+
+Read levels:
+  ONE          → read from 1 replica     (may be stale)
+  QUORUM       → read from 2, pick latest
+  LOCAL_QUORUM → quorum within DC only
+
+Strong consistency: W + R > N
+  QUORUM + QUORUM = 2 + 2 > 3 ✓  → always sees latest write
+  ONE + ONE = 1 + 1 ≤ 3          ✗  → may read stale
+```
+
+### Multi-DC replication — Netflix setup
+
+```
+us-east-1 (DC1, RF=3)              eu-west-1 (DC2, RF=3)
+┌──────────────────────┐            ┌──────────────────────┐
+│  Node A              │            │  Node E              │
+│  Node B  ◄──async────┼───────────►│  Node F              │
+│  Node C              │            │  Node G              │
+└──────────────────────┘            └──────────────────────┘
+
+Write with LOCAL_QUORUM:
+  Client (us-east-1) → coordinator in DC1
+  Waits for 2 of 3 acks within DC1 only (~1ms)
+  Async replication to DC2 in background (~50-100ms)
+  Client gets ack without waiting for DC2
+```
+
+```sql
+CREATE KEYSPACE netflix WITH replication = {
+  'class': 'NetworkTopologyStrategy',
+  'us-east-1': 3,
+  'eu-west-1': 3
+};
+```
+
+### Hinted Handoff — when a replica is down
+
+```
+Node D is down during write (W=QUORUM, N=3):
+
+  Coordinator → Node B ✓  ack
+  Coordinator → Node C ✓  ack  ← QUORUM met, return success to client
+  Coordinator → Node D ✗  down
+
+  Coordinator stores hint locally:
+    {key: "user:123", value: data, target: NodeD, timestamp: T}
+
+  Node D comes back → coordinator replays hint → Node D catches up
+  Hints stored up to 3 hours. If down longer → needs nodetool repair
+```
+
+### Read Repair — fixing stale replicas on reads
+
+```
+Read with QUORUM (reads 2 replicas):
+
+  Node B → {name: "Jay", version: 5}
+  Node C → {name: "Jay", version: 4}  ← stale
+
+  Coordinator returns version 5 to client (latest wins)
+  Background: writes version 5 back to Node C asynchronously
+```
+
+### Write path internals — inside each node
+
+```
+Write arrives at replica:
+
+  1. Commit Log (WAL)   ← sequential disk write, durable, fast
+          ↓
+  2. Memtable           ← in-memory sorted structure
+          ↓ (when full)
+  3. SSTable on disk    ← immutable sorted file, flushed from memtable
+          ↓ (background)
+  4. Compaction         ← merge SSTables, remove tombstones
+
+Why fast: append-only, no in-place updates = LSM tree pattern
+Same as RocksDB, HBase, DynamoDB internals
+```
+
+### Netflix's actual usage
+
+```
+Table: viewing_history
+  Partition key:  user_id      ← all rows for a user on same node set
+  Clustering key: watched_at   ← sorted within partition, DESC for recency
+  Value:          {show_id, progress, device, ...}
+
+Query: "Get last 20 shows watched by user 123"
+  → hash(user_id) → find replica nodes
+  → LOCAL_QUORUM read
+  → rows sorted by watched_at DESC LIMIT 20
+
+Why Cassandra fits Netflix:
+  Write-heavy (every play event = write)   → LSM, fast appends
+  Time-series access pattern               → clustering key = natural sort
+  Per-user locality                        → partition key = user_id, data co-located
+  Multi-region                             → NetworkTopologyStrategy + LOCAL_QUORUM
+  Petabyte scale                           → horizontal sharding via ring
+```
+
+### Failure scenarios
+
+```
+1. One replica down (RF=3, W=QUORUM):
+   → Works — write to 2 of 3, hinted handoff queues for dead node
+
+2. Two replicas down (RF=3, W=QUORUM):
+   → FAILS — can only reach 1 node, quorum needs 2
+   → Drop W to ONE to keep writing (lose consistency guarantee)
+
+3. Full DC down (multi-DC, LOCAL_QUORUM):
+   → LOCAL_QUORUM fails — can't reach quorum in local DC
+   → App switches to QUORUM (cross-DC) → higher latency but works
+   → Netflix: Route 53 failover to secondary DC
+
+4. Network partition between nodes:
+   → AP behavior: nodes on each side keep accepting writes
+   → On heal: last-write-wins (LWW) by timestamp resolves conflicts
+   → Risk: clock skew → wrong version wins → use NTP carefully
+```
+
+---
+
 ## Interview Questions
 
 1. **How does MySQL replication work?** Leader writes to binlog → replicas tail binlog and apply changes asynchronously. Row-based or statement-based.
 2. **What is replication lag and how do you handle it?** Time between leader write and replica apply. Handle via: route reads to leader when freshness needed, or use synchronous replication.
 3. **PostgreSQL vs MySQL replication?** PG: streaming replication (WAL), logical replication. MySQL: binlog-based. Both support async and semi-sync.
 4. **What is Raft?** A consensus algorithm for electing leaders and replicating log. Used by etcd, CockroachDB, TiKV. Guarantees that only one leader exists at a time.
+5. **How does Cassandra guarantee no data loss when a replica is down?** Hinted handoff — coordinator stores write locally and replays to the recovered node. For longer outages, nodetool repair uses Merkle trees to sync diverged data.
+6. **Why does Netflix use LOCAL_QUORUM instead of QUORUM?** QUORUM waits for acks across DCs (~100ms cross-region). LOCAL_QUORUM waits only within the local DC (~1ms), with async replication to other regions. Faster writes with acceptable eventual consistency across regions.
