@@ -346,13 +346,47 @@ public class ProductCDCConsumer {
 
 ## When to Use What
 
-| Need | Topology |
-|------|----------|
-| Simple read scaling | Single-leader, async replicas |
-| Multi-datacenter writes | Multi-leader (beware conflicts) |
-| High write availability, tunable consistency | Leaderless (Cassandra, DynamoDB) |
-| Zero data loss | Synchronous single-leader + STONITH |
-| Analytics without impacting prod | Read replica dedicated for analytics |
+| Need | Topology | Examples |
+|------|----------|---------|
+| Simple read scaling | Single-leader, async replicas | MySQL, PostgreSQL, RDS |
+| Multi-datacenter writes | Multi-leader (beware conflicts) | CockroachDB, MySQL Group Replication |
+| High write availability, tunable consistency | Leaderless | Cassandra, Riak |
+| Managed, per-partition leader election | Single-leader per partition (Paxos) | DynamoDB ← not leaderless |
+| Zero data loss | Synchronous single-leader + STONITH | RDS Multi-AZ |
+| Analytics without impacting prod | Read replica dedicated for analytics | Aurora read replicas |
+
+### DynamoDB replication — clarification
+
+DynamoDB is commonly misclassified as leaderless. It is **single-leader per partition**:
+
+```
+DynamoDB partition (one shard of your table):
+
+  AZ-1a: [Replica — LEADER]   ← all writes go here
+  AZ-1b: [Replica]             ← async replication from leader
+  AZ-1c: [Replica]             ← async replication from leader
+
+  Write path:  client → leader → ack (after leader + 1 replica durable)
+  Read (eventual): any replica — may be slightly stale
+  Read (strong):   leader only — always latest
+
+  Leader election: Multi-Paxos — replicas vote, majority elects new leader
+  Failover: ~seconds, automatic, managed by AWS
+```
+
+**Cassandra is truly leaderless:**
+```
+  Any node can be coordinator for any request
+  No election, no designated leader per partition
+  Client writes to W replicas directly (or via coordinator)
+  Pure quorum: W + R > N for consistency
+  Any node failure → other nodes absorb writes immediately
+```
+
+**Why DynamoDB chose leader per partition:**
+- Simpler conflict resolution — only one writer at a time per key
+- Stronger consistency option (strongly consistent reads) — only possible with a known leader
+- Trade-off: leader = single write path, but AWS manages failover transparently
 
 ---
 
