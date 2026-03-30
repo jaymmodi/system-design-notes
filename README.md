@@ -37,7 +37,8 @@ system-design-notes/
 │   ├── 26-netflix-data-platform.md
 │   ├── 27-infrastructure-k8s.md
 │   ├── 28-java-sizes-boe.md          — primitive/object/collection sizes for back-of-envelope
-│   └── 29-system-design-questions.md — common design questions with thought process + solutions
+│   ├── 29-system-design-questions.md — common design questions with thought process + solutions
+│   └── 30-cassandra-vs-dynamodb.md   — deep dive: data model, replication, consistency, ops, cost
 │
 ├── data-structures/                  — internals: how storage engines work
 │   ├── 08-bloom-filters.md
