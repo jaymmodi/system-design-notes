@@ -327,6 +327,105 @@ Your async DynamoDB optimization:
 
 ---
 
+## Prefix Bloom Filters — Range Scan Optimization
+
+### The problem — regular bloom filters don't help prefix scans
+
+Regular bloom filters answer one question: **"is this exact key in this SSTable?"**
+
+```
+Bloom filter check: "is 'user:123:profile' in SSTable 4?" → yes/no
+
+But for: "are there ANY keys starting with 'user:123:' in SSTable 4?"
+  → Can't ask this — would need to enumerate every possible suffix
+  → user:123:profile, user:123:settings, user:123:history ... impossible
+
+So for prefix/range queries, bloom filters are useless → must open every SSTable:
+
+Query: scan all keys for user:123
+
+  Open SSTable 1 → scan → no keys for user:123  (wasted)
+  Open SSTable 2 → scan → no keys for user:123  (wasted)
+  Open SSTable 3 → scan → found 2 keys
+  Open SSTable 4 → scan → no keys for user:123  (wasted)
+  Open SSTable 5 → scan → found 1 key
+  → 3 of 5 SSTables were unnecessary disk reads
+```
+
+### The fix — bloom on the prefix, not the full key
+
+```
+Building SSTable — keys written:
+  user:123:profile
+  user:123:settings
+  user:456:profile
+  user:789:history
+
+Regular bloom:  {user:123:profile, user:123:settings, user:456:profile, user:789:history}
+
+Prefix bloom (prefix = partition key, everything before last ':'):
+  PFADD "user:123"  (from user:123:profile)
+  PFADD "user:123"  (from user:123:settings — already set, no-op)
+  PFADD "user:456"  (from user:456:profile)
+  PFADD "user:789"  (from user:789:history)
+  → {user:123, user:456, user:789}
+
+Query: scan all keys for user:999
+
+  SSTable 1 prefix bloom: "user:999? definitely not here" → SKIP ✓
+  SSTable 2 prefix bloom: "user:999? definitely not here" → SKIP ✓
+  SSTable 3 prefix bloom: "user:999? maybe here"          → open and scan
+  SSTable 4 prefix bloom: "user:999? definitely not here" → SKIP ✓
+  → opened 1 SSTable instead of 4
+```
+
+### How RocksDB and Cassandra implement it
+
+**RocksDB — prefix extractor:**
+```java
+Options options = new Options();
+options.useFixedLengthPrefixExtractor(8); // first 8 bytes = prefix
+// RocksDB builds bloom filter on extracted prefixes, not full keys
+
+RocksIterator iter = db.newIterator();
+iter.seek("user:123");
+while (iter.isValid() && iter.key().startsWith("user:123")) {
+    // only SSTables that might contain "user:123" prefix were opened
+    iter.next();
+}
+```
+
+**Cassandra — partition key is the prefix:**
+```
+Key structure:  partition_key : clustering_key : column
+                "user:123"    : "2024-01-01"   : "profile"
+                "user:123"    : "2024-01-02"   : "settings"
+
+Prefix bloom = bloom on partition key only ("user:123")
+
+SELECT * FROM events WHERE user_id = 'user:123'
+  → extract partition key → check prefix bloom on each SSTable
+  → SSTables with no "user:123" partition → skipped entirely
+```
+
+### Regular vs prefix bloom — when to use which
+
+```
+Regular bloom:   exact key lookups    GET user:123:profile
+Prefix bloom:    prefix/range scans   SCAN user:123:*
+
+Trade-off of prefix bloom:
+  Fewer distinct values → bits more densely set → higher false positive rate
+  "user:123" prefix shared across many keys → one bit set serves all
+  but other prefixes collide more easily
+
+RocksDB uses both:
+  Exact lookup → check regular bloom first
+  Prefix scan  → check prefix bloom first
+```
+
+---
+
 ## Interview One-liner
 
 > "LSM trees convert random writes into sequential writes by buffering in a sorted in-memory skiplist (MemTable), flushing immutable sorted files (SSTables) to disk, and periodically merging them in the background (compaction). Reads pay read amplification — checking multiple SSTables — mitigated by bloom filters that eliminate 99%+ of unnecessary file reads. The fundamental trade-off is write amplification vs read amplification vs space amplification, tuned by compaction strategy. This makes LSM ideal for write-heavy workloads like event streams, audit logs, and time-series data — exactly the profile of a Kafka/Flink data platform."
