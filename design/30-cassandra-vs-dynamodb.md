@@ -344,6 +344,156 @@ Neither is right for:
 
 ---
 
+## Cassandra is Java — JVM in Operations
+
+Cassandra is written entirely in Java. The JVM is central to how it behaves under load.
+
+### What lives in the JVM heap
+```
+JVM Heap (default 8GB, recommended 8–16GB, never > 31GB):
+
+  ┌─────────────────────────────────────────┐
+  │  Memtable (skiplist)                    │ ← all writes buffer here
+  │  Bloom filters (all SSTables)           │ ← one per SSTable, in RAM
+  │  Key cache                              │ ← partition key → SSTable offset
+  │  Row cache (if enabled)                 │ ← full rows cached
+  │  Internal metadata, thread stacks       │
+  └─────────────────────────────────────────┘
+
+Off-heap (not in JVM heap):
+  OS page cache      ← SSTable data blocks cached by OS
+  Netty buffers      ← network I/O
+  Compression buffers
+```
+
+### Why heap > 31GB is dangerous
+```
+JVM uses Compressed Object Pointers (CompressedOops) when heap < 32GB:
+  Object reference = 4 bytes  ← cache-friendly, fits in register
+
+Heap > 32GB:
+  Object reference = 8 bytes  ← full 64-bit pointer
+  Bloom filters + key cache grow 2×
+  More GC pressure
+  Performance DROPS despite more memory
+
+Rule: keep heap ≤ 31GB. Give remaining RAM to OS page cache for SSTables.
+
+  Machine: 128GB RAM
+  JVM heap:      16GB   ← memtable, bloom filters, key cache
+  OS page cache: 112GB  ← SSTables served at near-RAM speed
+```
+
+### GC — the real operational headache
+
+GC stop-the-world pauses = request timeouts:
+
+```
+Normal:
+  Write → memtable → ack in ~1ms
+
+GC pause (stop-the-world):
+  All Cassandra threads frozen
+  Pending requests queue up
+  Client sees timeout (default 2s)
+
+Long GC pause (> 5s):
+  Gossip heartbeats missed
+  Other nodes mark this node DOWN
+  Hinted handoff kicks in for missed writes
+  → looks like node failure — hardware is fine, JVM paused
+```
+
+### GC algorithms
+
+```
+Old (pre-4.0):   CMS — low pause but fragmentation → eventual full GC
+Current (4.0+):  G1GC (default)
+  -Xms16G -Xmx16G              ← same min/max prevents resize pauses
+  -XX:+UseG1GC
+  -XX:MaxGCPauseMillis=300     ← target max pause 300ms
+
+Experimental:    ZGC / Shenandoah
+  Sub-millisecond pauses, concurrent collection
+  Netflix and large operators test these for p99 improvement
+```
+
+### What causes GC pressure
+```
+1. Large memtables before flush
+   Fix: tune memtable_heap_space, flush more frequently
+
+2. Tombstone reads
+   Reading partition with many deletes → loads tombstones into heap
+   Fix: TTL-based expiry, limit tombstone_failure_threshold
+
+3. Wide partition full scan
+   SELECT * on millions of rows → loads all into heap
+   Fix: always use LIMIT, paginate results
+
+4. Too many SSTables
+   More SSTables = more bloom filters in heap
+   Fix: aggressive compaction, tune bloom_filter_fp_chance
+```
+
+### Thread model — SEDA architecture
+```
+Cassandra uses staged event-driven architecture:
+
+  Netty I/O threads (non-blocking, off-heap)
+        ↓
+  Stage thread pools:
+    Native Transport   ← receive client requests
+    Mutation Stage     ← handle writes
+    Read Stage         ← handle reads
+    Compaction         ← background SSTable merging
+    Memtable Flush     ← flush to SSTable
+    Gossip Stage       ← cluster heartbeats
+    HintedHandoff      ← replay hints to recovered nodes
+
+Each stage has its own thread pool + queue.
+Queue fills up → TooManyRequestsException
+```
+
+Monitor thread pool health:
+```bash
+nodetool tpstats
+
+# Pool Name          Active  Pending  Completed  Blocked
+# MutationStage         4        0    1234567       0   ← healthy
+# ReadStage             2      150    9876543       0   ← 150 pending, watch this
+# CompactionExecutor    1        8      45678       0   ← 8 pending compactions
+```
+
+### Diagnosing high p99 latency (all JVM-related)
+```
+"Node shows high p99 but CPU is fine"
+
+Check in order:
+  1. GC pause        → nodetool gcstats, GC logs
+  2. Compaction lag  → too many SSTables → nodetool compactionstats
+  3. Thread backpressure → nodetool tpstats, Pending > 0
+  4. Tombstone storm → slow query log, check data model
+
+Fix:
+  GC pause    → tune G1GC, reduce heap pressure (smaller memtable)
+  Compaction  → increase compaction throughput, switch strategy
+  Thread pool → increase pool size carefully, or scale out
+  Tombstones  → add LIMIT, fix data model, lower gc_grace_seconds
+```
+
+### DynamoDB has none of these concerns
+```
+No JVM. No GC. No heap tuning. No thread pool monitoring.
+AWS handles all of it internally.
+
+This is the single biggest operational difference:
+  Cassandra: p99 spikes → is it GC? compaction? tombstones? thread pool?
+  DynamoDB:  p99 spikes → is it throttling? hot partition? that's it.
+```
+
+---
+
 ## Interview one-liner
 
-> "Both are wide-column stores for write-heavy, partition-key-based workloads at scale. Key difference: Cassandra is leaderless — any node coordinates, tunable W+R quorum per query, you operate the ring. DynamoDB has a leader per partition via Multi-Paxos, two consistency modes, fully AWS-managed. Cassandra gives full control at the cost of ops complexity; DynamoDB gives zero ops at the cost of flexibility and AWS lock-in. Netflix uses Cassandra for petabyte-scale time-series with LOCAL_QUORUM across DCs, and DynamoDB for lower-volume services where zero ops matters more than fine-grained tuning."
+> "Both are wide-column stores for write-heavy, partition-key-based workloads at scale. Key difference: Cassandra is leaderless — any node coordinates, tunable W+R quorum per query, you operate the ring. DynamoDB has a leader per partition via Multi-Paxos, two consistency modes, fully AWS-managed. Cassandra gives full control at the cost of ops complexity — including JVM heap tuning, GC pause management, and compaction monitoring; DynamoDB gives zero ops at the cost of flexibility and AWS lock-in. Netflix uses Cassandra for petabyte-scale time-series with LOCAL_QUORUM across DCs, and DynamoDB for lower-volume services where zero ops matters more than fine-grained tuning."
