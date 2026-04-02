@@ -1096,3 +1096,252 @@ Use HTTP API when:
 5. **How do you secure an API Gateway endpoint?** Layered: WAF (IP blocking, OWASP rules) → throttling (rate limit per key/IP) → authentication (Lambda authorizer, Cognito, IAM) → authorization (IAM policy from authorizer scoped to specific routes).
 6. **How does API GW route to private ECS services?** VPC Link → NLB in private subnet → ECS tasks. API GW is public; backends have no public IP. NLB is the only entry point into the VPC.
 7. **REST API vs HTTP API?** REST API: full-featured (caching, transform, API keys). HTTP API: 70% cheaper, lower latency, JWT only, no transform. Use HTTP API by default unless you need REST API features.
+
+---
+
+## 100K TPS Architecture — API Gateway + NLB + Private ECS
+
+### Core mental model
+
+```
+API Gateway IS the edge + L7 router.
+NLB sits INSIDE your VPC as the bridge from API GW → private ECS.
+You don't put an ALB between the internet and API GW.
+
+Internet → API GW → VPC Link → NLB (private) → ECS tasks
+           (edge)              (bridge)          (your code)
+```
+
+### Full AWS Account Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  AWS ACCOUNT                                                                │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Route 53                                                           │   │
+│  │  api.myapp.com  ──ALIAS──→  d1234.execute-api.amazonaws.com        │   │
+│  └─────────────────────────────────┬───────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────▼───────────────────────────────────┐   │
+│  │  AWS WAF                                                            │   │
+│  │  - Block malicious IPs / countries                                  │   │
+│  │  - Rate limit: 2000 req/5min per IP                                 │   │
+│  │  - OWASP Top 10 managed rules (SQLi, XSS)                          │   │
+│  └─────────────────────────────────┬───────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────▼───────────────────────────────────┐   │
+│  │  API GATEWAY  (Regional, REST API)          TLS terminates HERE     │   │
+│  │  api.myapp.com  +  ACM Certificate                                  │   │
+│  │                                                                     │   │
+│  │  ┌──────────────┐  ┌────────────────┐  ┌─────────────────────┐    │   │
+│  │  │  Throttling  │  │ Lambda Auth    │  │  Caching (optional) │    │   │
+│  │  │  100K TPS    │  │ JWT validate   │  │  TTL per route      │    │   │
+│  │  │  burst: 200K │  │ cache 5 min    │  │                     │    │   │
+│  │  └──────────────┘  └────────────────┘  └─────────────────────┘    │   │
+│  │                                                                     │   │
+│  │  Route: ANY /{proxy+}  →  VPC_LINK integration                     │   │
+│  └─────────────────────────────────┬───────────────────────────────────┘   │
+│                                    │                                        │
+│                              VPC Link                                       │
+│                         (bridge: public → VPC)                             │
+│                                    │                                        │
+│  ┌─────────────────────────────────▼───────────────────────────────────┐   │
+│  │  VPC  (10.0.0.0/16)                                                 │   │
+│  │                                                                     │   │
+│  │  ┌──────────────────────────────────────────────────────────────┐  │   │
+│  │  │  PUBLIC SUBNETS (10.0.1.0/24, 10.0.2.0/24, 10.0.3.0/24)    │  │   │
+│  │  │                                                               │  │   │
+│  │  │  ┌─────────────────────────────────────────────────────┐    │  │   │
+│  │  │  │  NLB  (internal, NOT internet-facing)               │    │  │   │
+│  │  │  │  - Static IPs per AZ (required by VPC Link)         │    │  │   │
+│  │  │  │  - TCP passthrough (no HTTP parsing overhead)        │    │  │   │
+│  │  │  │  - Health checks → ECS tasks on port 8080           │    │  │   │
+│  │  │  └──────────────┬──────────────────────────────────────┘    │  │   │
+│  │  └─────────────────┼─────────────────────────────────────────-─┘  │   │
+│  │                    │                                                │   │
+│  │  ┌─────────────────▼────────────────────────────────────────────┐  │   │
+│  │  │  PRIVATE SUBNETS (10.0.4.0/24, 10.0.5.0/24, 10.0.6.0/24)   │  │   │
+│  │  │                                                               │  │   │
+│  │  │  ECS Cluster (Fargate)                                        │  │   │
+│  │  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │  │   │
+│  │  │  │  Task (AZ-a) │  │  Task (AZ-b) │  │  Task (AZ-c) │       │  │   │
+│  │  │  │  10.0.4.10   │  │  10.0.5.10   │  │  10.0.6.10   │       │  │   │
+│  │  │  │  port: 8080  │  │  port: 8080  │  │  port: 8080  │       │  │   │
+│  │  │  │  NO public IP│  │  NO public IP│  │  NO public IP│       │  │   │
+│  │  │  └──────────────┘  └──────────────┘  └──────────────┘       │  │   │
+│  │  │                                                               │  │   │
+│  │  │  NAT Gateway (outbound only — ECR image pulls, etc.)         │  │   │
+│  │  │                                                               │  │   │
+│  │  │  ┌────────────────────────────────────────────────────────┐  │  │   │
+│  │  │  │  DATA LAYER (private, no route to internet)            │  │  │   │
+│  │  │  │  ┌──────────────────┐   ┌──────────────────────────┐  │  │  │   │
+│  │  │  │  │  RDS Aurora      │   │  ElastiCache (Redis)     │  │  │  │   │
+│  │  │  │  │  Multi-AZ        │   │  cluster mode            │  │  │  │   │
+│  │  │  │  └──────────────────┘   └──────────────────────────┘  │  │  │   │
+│  │  │  └────────────────────────────────────────────────────────┘  │  │   │
+│  │  └───────────────────────────────────────────────────────────────┘  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  Lambda Authorizer fn  │  CloudWatch Logs  │  X-Ray  │  ECR (images)       │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Request flow — step by step
+
+```
+1. Client: GET https://api.myapp.com/orders/123
+           Authorization: Bearer eyJhbGc...
+
+2. Route 53  → ALIAS → API GW custom domain (free, within AWS, no extra hop)
+
+3. WAF       → check IP, rate limit, OWASP rules
+               blocked? → 403, never hits API GW
+
+4. API GW    → TLS terminated (ACM cert)
+               throttle check: within 100K TPS?
+               throttled? → 429, never hits Lambda or backend
+
+5. API GW    → Lambda Authorizer (or cache hit at 5 min TTL)
+               validates JWT, returns IAM policy + context {userId, plan}
+               deny? → 403
+
+6. API GW    → route match: ANY /{proxy+}
+               integration: VPC_LINK → NLB DNS
+
+7. VPC Link  → tunnels request from API GW into VPC
+               resolves NLB DNS → NLB static IP in target AZ
+
+8. NLB       → TCP load balances to healthy ECS task (same AZ preferred)
+               health check failing on task? → skip it
+
+9. ECS Task  → receives HTTP, no public IP
+               headers from API GW:
+                 X-User-Id: "u123"       (from Lambda authorizer context)
+                 X-User-Plan: "pro"
+                 X-Forwarded-For: client IP
+               queries RDS/Redis via private DNS (never leaves VPC)
+               returns response
+
+10. Response: ECS → NLB → VPC Link → API GW → (cache?) → WAF → client
+```
+
+### Why NLB and not ALB inside VPC
+
+```
+VPC Link REQUIRES NLB — ALB is not supported as VPC Link target.
+NLB = TCP passthrough — no HTTP parsing, less overhead at 100K TPS.
+NLB has static IPs per AZ — VPC Link needs stable IPs to connect to.
+API GW already handles all L7 concerns — NLB just distributes TCP.
+```
+
+### 100K TPS — limits to raise
+
+```
+Layer                  Default          Action needed
+────────────────────────────────────────────────────────────
+API GW account         10K req/sec      Request increase to 100K
+API GW stage           10K req/sec      Set stage throttle to 100K/200K burst
+Lambda Authorizer      3K concurrent    Cache responses TTL=300s (solves it)
+ECS tasks              ~2K req/task     Scale to ~50 tasks min (100K / 2K)
+RDS connections        ~30K            Use RDS Proxy (connection pooling)
+ElastiCache            100K+ ops/sec   Fine per node
+NLB                    Millions/sec    Fine
+```
+
+### Security groups — layered access
+
+```
+nlb-sg:   inbound from VPC Link CIDR on 80 only
+          outbound to ecs-sg on 8080
+
+ecs-sg:   inbound from nlb-sg on 8080 ONLY  ← no internet access
+          outbound to rds-sg:5432, redis-sg:6379
+          outbound to 0.0.0.0/0:443 via NAT (ECR pulls)
+
+rds-sg:   inbound from ecs-sg on 5432 ONLY
+          outbound: none
+
+ECS tasks have zero inbound from internet.
+Only reachable via NLB → VPC Link → API GW.
+```
+
+### Terraform — key wiring
+
+```hcl
+# NLB — internal
+resource "aws_lb" "internal_nlb" {
+  name               = "api-internal-nlb"
+  internal           = true
+  load_balancer_type = "network"
+  subnets            = var.private_subnet_ids
+  enable_cross_zone_load_balancing = true
+}
+
+resource "aws_lb_target_group" "ecs_tg" {
+  name        = "ecs-tasks-tg"
+  port        = 8080
+  protocol    = "TCP"
+  target_type = "ip"        # Fargate = IP targets
+  vpc_id      = var.vpc_id
+  health_check {
+    protocol            = "HTTP"
+    path                = "/health"
+    interval            = 10
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+  }
+}
+
+# VPC Link
+resource "aws_api_gateway_vpc_link" "main" {
+  name        = "api-vpc-link"
+  target_arns = [aws_lb.internal_nlb.arn]
+}
+
+# API GW proxy integration → NLB via VPC Link
+resource "aws_api_gateway_integration" "nlb_integration" {
+  rest_api_id             = aws_api_gateway_rest_api.main.id
+  resource_id             = aws_api_gateway_resource.proxy.id
+  http_method             = "ANY"
+  type                    = "HTTP_PROXY"
+  integration_http_method = "ANY"
+  uri                     = "http://${aws_lb.internal_nlb.dns_name}/{proxy}"
+  connection_type         = "VPC_LINK"
+  connection_id           = aws_api_gateway_vpc_link.main.id
+}
+
+# Stage with 100K TPS throttle
+resource "aws_api_gateway_stage" "prod" {
+  stage_name    = "prod"
+  rest_api_id   = aws_api_gateway_rest_api.main.id
+  deployment_id = aws_api_gateway_deployment.main.id
+  default_route_settings {
+    throttling_rate_limit  = 100000
+    throttling_burst_limit = 200000
+  }
+}
+```
+
+### When to skip API GW and use ALB directly
+
+```
+Use API GW + NLB when:
+  ✓ Public API (external clients, partners, mobile)
+  ✓ Need centralized JWT/OAuth auth
+  ✓ Need per-client throttling (usage plans + API keys)
+  ✓ Need WAF
+  ✓ Need response caching
+  ✓ Serverless billing (pay per request, no idle cost)
+
+Use ALB directly (skip API GW) when:
+  ✓ Internal service-to-service only (east-west traffic)
+  ✓ Auth handled by service mesh / sidecar
+  ✓ Lowest possible latency (ALB adds ~1ms, API GW adds ~5-10ms)
+  ✓ Very high sustained TPS where API GW cost exceeds ALB cost
+  ✓ WebSocket at massive scale (NLB better than API GW WebSocket)
+
+ALB-only: Internet → Route 53 → ALB (public, TLS) → ECS (private)
+  ALB handles: TLS, path routing, health checks
+  App handles: auth, rate limiting in code or sidecar
+```
