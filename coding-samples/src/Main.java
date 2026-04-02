@@ -6,7 +6,7 @@ import java.util.concurrent.Executors;
 public class Main {
 
     public static void main(String[] args) {
-        BlockingQueue<String> queue = new Llinked<>(100);
+        BlockingQueue<String> queue = new ArrayBlockingQueue<>(1000);
         System.out.println("queue = " + queue.size());
 
 
