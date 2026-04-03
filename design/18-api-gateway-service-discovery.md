@@ -1376,3 +1376,134 @@ ALB-only: Internet → Route 53 → ALB (public, TLS) → ECS (private)
   ALB handles: TLS, path routing, health checks
   App handles: auth, rate limiting in code or sidecar
 ```
+
+---
+
+## Public + Private API Gateway Pattern — Infrastructure Opacity
+
+### The problem with AWS_IAM auth on a public API
+
+If external clients need `execute-api:Invoke` in their IAM policy, they know it's API Gateway.
+That leaks your infrastructure. For a service like GuardDuty, clients should only need
+`guardduty:ListFindings` — not care what's behind it.
+
+```
+AWS_IAM auth  → client needs execute-api:Invoke → reveals API GW ✗
+Lambda Auth   → client needs guardduty:ListFindings only → opaque ✓
+```
+
+### Two API Gateways: public-facing + internal
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│  PUBLIC LAYER  (external clients — boto3, CLI, SDKs)                           │
+│                                                                                 │
+│  boto3.client('guardduty').list_findings()                                      │
+│    → SigV4 signed: service="guardduty"                                          │
+│    → sends to guardduty.us-east-1.amazonaws.com   ← custom domain, hides API GW│
+│                                                                                 │
+│                          DNS (Route 53 ALIAS)                                   │
+│                                 │                                               │
+│  ┌──────────────────────────────▼──────────────────────────────────────────┐   │
+│  │  PUBLIC API GATEWAY   (custom domain: guardduty.us-east-1.amazonaws.com)│   │
+│  │                                                                         │   │
+│  │  Auth: Lambda Authorizer  ← NOT AWS_IAM (would reveal API GW)          │   │
+│  │    receives: Authorization: AWS4-HMAC-SHA256 Credential=.../guardduty/..│   │
+│  │    validates: SigV4 signature for service="guardduty"                   │   │
+│  │    calls IAM: does caller have guardduty:ListFindings?                  │   │
+│  │    returns: Allow/Deny IAM policy + principal context                   │   │
+│  │                                                                         │   │
+│  │  Client has NO idea this is API Gateway:                                │   │
+│  │    → IAM policy only needs guardduty:ListFindings                       │   │
+│  │    → no execute-api:Invoke                                              │   │
+│  │    → infrastructure fully opaque                                        │   │
+│  └──────────────────────────────┬──────────────────────────────────────────┘   │
+│                                 │ VPC Link → NLB                                │
+└─────────────────────────────────┼───────────────────────────────────────────────┘
+                                  │
+┌─────────────────────────────────┼───────────────────────────────────────────────┐
+│  PRIVATE VPC                    │                                               │
+│                                 ▼                                               │
+│              ┌──────────────────────────────────────┐                          │
+│              │  GuardDuty Backend Service (ECS)      │                          │
+│              │  - receives verified principal context │                          │
+│              │  - executes business logic             │                          │
+│              └──────────────────┬───────────────────┘                          │
+│                                 │  needs to call internal microservices         │
+│                                 ▼                                               │
+│  ┌──────────────────────────────────────────────────────────────────────────┐  │
+│  │  PRIVATE API GATEWAY  (VPC endpoint — not reachable from internet)      │  │
+│  │                                                                          │  │
+│  │  Auth: AWS_IAM  ← fine here, internal services know the infra           │  │
+│  │    caller needs: execute-api:Invoke on internal API ARN                  │  │
+│  │    → backend ECS task role has execute-api:Invoke                        │  │
+│  │    → no external client ever sees this                                   │  │
+│  │                                                                          │  │
+│  │  Routes to internal microservices:                                       │  │
+│  │    /findings-db   → FindingsStore Lambda                                 │  │
+│  │    /detectors     → DetectorConfig Lambda                                │  │
+│  │    /alerts        → AlertDispatch Lambda                                 │  │
+│  └──────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Why two gateways, not one
+
+```
+Single API GW problem:
+  External clients + internal services both hit same gateway
+  → AWS_IAM:          external clients see execute-api:Invoke (leaks infra)
+  → Lambda Authorizer: internal services pay Lambda invoke latency on every hop
+  → mixed auth rules become complex
+
+Two gateways:
+  Public API GW  → Lambda Authorizer → external clients, infrastructure opaque
+  Private API GW → AWS_IAM           → internal only, infra exposure is fine,
+                                        no Lambda overhead, pure IAM check
+```
+
+### What the Lambda Authorizer does on the public gateway
+
+Validates SigV4 for the service name clients use ("guardduty"), not "execute-api":
+
+```python
+def handler(event, context):
+    auth_header = event['authorizationToken']
+    # "AWS4-HMAC-SHA256 Credential=ASIA.../guardduty/aws4_request, ..."
+    #                                          ↑ "guardduty" not "execute-api"
+
+    # 1. Identify the principal via STS
+    access_key_id = parse_access_key(auth_header)
+    identity = boto3.client('sts').get_caller_identity()
+
+    # 2. Verify SigV4 signature is valid for service="guardduty"
+    verify_sigv4(event, secret_key=resolve_secret(access_key_id), service="guardduty")
+
+    # 3. Check IAM: does this principal have guardduty:ListFindings?
+    result = boto3.client('iam').simulate_principal_policy(
+        PolicySourceArn=identity['Arn'],
+        ActionNames=['guardduty:ListFindings']
+    )
+
+    effect = "Allow" if result['EvaluationResults'][0]['EvalDecision'] == 'allowed' else "Deny"
+    return build_policy(principal_id=identity['Arn'], effect=effect, resource=event['methodArn'])
+```
+
+Client IAM policy only needs:
+```json
+{ "Action": "guardduty:ListFindings", "Resource": "*" }
+```
+No `execute-api:Invoke`. API Gateway is invisible to the client.
+
+### Note: real AWS services don't use API Gateway
+
+```
+Real GuardDuty, S3, EC2 etc.:
+  → own proprietary service endpoints and service fabric
+  → SigV4 validation baked into service code
+  → IAM evaluation via AWS-internal IAM service (not Lambda)
+  → no API GW involved
+
+This two-gateway pattern is what YOU build when building a GuardDuty-like
+service yourself. The auth model is identical — implementation differs.
+```
