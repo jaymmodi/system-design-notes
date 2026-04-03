@@ -483,6 +483,8 @@ No cert management on your backend servers.
 
 ```yaml
 # CloudFormation / SAM — custom domain + cert
+# docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-certificatemanager-certificate.html
+# docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-route53-recordset.html
 Resources:
   ApiCertificate:
     Type: AWS::CertificateManager::Certificate
@@ -492,9 +494,12 @@ Resources:
 
   CustomDomain:
     Type: AWS::ApiGateway::DomainName
+    # docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-domainname.html
     Properties:
       DomainName: api.myapp.com
-      CertificateArn: !Ref ApiCertificate
+      RegionalCertificateArn: !Ref ApiCertificate  # RegionalCertificateArn for REGIONAL endpoints
+      EndpointConfiguration:
+        Types: [REGIONAL]            # REGIONAL or EDGE (edge uses CertificateArn instead)
       SecurityPolicy: TLS_1_2        # enforce minimum TLS version
 
   BasePathMapping:
@@ -515,8 +520,8 @@ Route 53 alias to API Gateway:
       Name: api.myapp.com
       Type: A
       AliasTarget:
-        DNSName: !GetAtt CustomDomain.DistributionDomainName
-        HostedZoneId: !GetAtt CustomDomain.DistributionHostedZoneId
+        DNSName: !GetAtt CustomDomain.RegionalDomainName         # RegionalDomainName for REGIONAL endpoints
+        HostedZoneId: !GetAtt CustomDomain.RegionalHostedZoneId  # (DistributionDomainName/HostedZoneId is for EDGE/CloudFront)
 ```
 
 ---
@@ -564,6 +569,8 @@ Flow:
 ```
 
 ```yaml
+# docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-authorizer.html
+# docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-method.html
 # CloudFormation
   CognitoAuthorizer:
     Type: AWS::ApiGateway::Authorizer
@@ -667,6 +674,7 @@ private APIGatewayCustomAuthorizerResponse buildPolicy(
 ```
 
 ```yaml
+# docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-authorizer.html
   LambdaAuthorizer:
     Type: AWS::ApiGateway::Authorizer
     Properties:
@@ -693,6 +701,9 @@ Flow:
 ```
 
 ```yaml
+# docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-apikey.html
+# docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-usageplan.html
+# docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-usageplankey.html
   ApiKey:
     Type: AWS::ApiGateway::ApiKey
     Properties:
@@ -797,6 +808,7 @@ v2     → Lambda:v2 alias → new version (canary: 10% traffic)
 
 #### Canary deployments
 ```yaml
+# docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-stage.html
   ApiStage:
     Type: AWS::ApiGateway::Stage
     Properties:
@@ -820,6 +832,7 @@ Internet → API Gateway → VPC Link → NLB (private) → ECS Service
 ```
 
 ```yaml
+# docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-vpclink.html
   VpcLink:
     Type: AWS::ApiGateway::VpcLink
     Properties:
@@ -828,9 +841,15 @@ Internet → API Gateway → VPC Link → NLB (private) → ECS Service
         - !Ref PrivateNLB        # NLB in your VPC
 
   # Integration using VPC Link
-  Integration:
+  # docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-method.html
+  ProxyMethod:
     Type: AWS::ApiGateway::Method
     Properties:
+      RestApiId: !Ref MyApi          # required
+      ResourceId: !Ref ProxyResource # required — the {proxy+} resource
+      HttpMethod: ANY                # required
+      AuthorizationType: CUSTOM      # required (NONE | AWS_IAM | CUSTOM | COGNITO_USER_POOLS)
+      AuthorizerId: !Ref LambdaAuthorizer
       Integration:
         Type: HTTP_PROXY
         ConnectionType: VPC_LINK
@@ -870,6 +889,7 @@ Two levels:
 ```
 
 ```yaml
+# docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-stage.html
   ApiStage:
     Type: AWS::ApiGateway::Stage
     Properties:
@@ -926,6 +946,7 @@ Useful for: legacy backend with different field names, adding metadata, hiding i
 ### Caching (REST API only)
 
 ```yaml
+# docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-stage.html
   ApiStage:
     Type: AWS::ApiGateway::Stage
     Properties:
@@ -956,11 +977,17 @@ Or: invalidate via API GW console / CLI
 
 ```yaml
   WafAcl:
+    # docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-wafv2-webacl.html
     Type: AWS::WAFv2::WebACL
     Properties:
+      Name: ApiWaf
       Scope: REGIONAL
       DefaultAction:
         Allow: {}
+      VisibilityConfig:              # required top-level property
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: ApiWafMetrics
       Rules:
         - Name: RateLimitRule
           Priority: 1
@@ -989,6 +1016,7 @@ Or: invalidate via API GW console / CLI
             MetricName: CommonRules
 
   WafAssociation:
+    # docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-wafv2-webaclassociation.html
     Type: AWS::WAFv2::WebACLAssociation
     Properties:
       ResourceArn: !Sub
@@ -1033,6 +1061,7 @@ All traffic: CloudWatch Logs + X-Ray tracing
 ### CORS — common gotcha
 
 ```yaml
+# docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-method.html
 # REST API — enable CORS on each resource
   OptionsMethod:
     Type: AWS::ApiGateway::Method
