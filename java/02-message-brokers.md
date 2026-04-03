@@ -6,27 +6,51 @@
 
 ## The Mental Model First
 
-These four tools solve different versions of the same problem: **decouple producers from consumers**.
-
-But they differ on one critical axis:
+Six tools, three fundamentally different models:
 
 ```
-Queue (consume-and-delete)          Log (retain-and-replay)
-        │                                    │
-       SQS                          Kafka / Kinesis / Redis Streams
-        │
-  "Task queue"                      "Event log"
-  Message gone after consumed       Message stays, many consumers can replay
-  No history                        History = first-class feature
+Fire-and-forget broadcast          Queue (consume-and-delete)       Log (retain-and-replay)
+         │                                    │                              │
+Redis pub/sub, SNS                           SQS                  Kafka, Kinesis, Redis Streams
+         │                                    │                              │
+  "Notification"                        "Task queue"                  "Event log"
+  All subscribers get it               One consumer gets it          Many consumers, replay
+  No history whatsoever                No history                    History is first-class
+  Subscriber must be online            Visibility timeout            Consumers read at own pace
 ```
 
-**The key question**: Does the message have value after one consumer reads it?
-- No → SQS (task queue, job dispatch)
-- Yes → Kafka/Kinesis/Redis Streams (event log, analytics, audit trail)
+**The key questions:**
+1. Does missing a message matter? → No = pub/sub, Yes = queue or log
+2. Does the message have value after one consumer reads it? → No = SQS, Yes = log
+3. Do multiple independent services need the same event? → Yes = SNS fan-out or Kafka
+4. Do you need replay? → Yes = Kafka/Kinesis/Redis Streams
 
 ---
 
 ## Architecture Side by Side
+
+### Redis Pub/Sub
+```
+Publisher → PUBLISH channel "message"
+                 ↓ broadcast simultaneously
+         Subscriber A  Subscriber B  Subscriber C
+         (all connected clients get it right now)
+
+No persistence. Subscriber offline = message lost.
+No history. No consumer groups. Pure broadcast.
+```
+
+### SNS
+```
+Publisher → SNS Topic → push to ALL subscriptions simultaneously
+                ├── SQS Queue A  → Email Service (queue buffers, durable)
+                ├── SQS Queue B  → Analytics Service
+                ├── Lambda fn    → immediate execution
+                ├── HTTP endpoint → your webhook
+                └── SMS / Email  → direct delivery
+
+No storage in SNS itself. Each subscriber gets their own copy pushed to them.
+```
 
 ### SQS
 ```
@@ -76,26 +100,200 @@ Persistence: RDB snapshot + AOF (configurable, not as durable as Kafka)
 
 ---
 
-## Feature Comparison Table
+## Comprehensive Comparison Table
 
-| Feature | SQS | Kinesis | Kafka | Redis Streams |
-|---------|-----|---------|-------|---------------|
-| **Model** | Queue (delete on ack) | Log | Log | Log |
-| **Ordering** | None (FIFO: per group) | Per shard | Per partition | Global (single stream) |
-| **Retention** | Up to 14 days | 24hr–365 days | Configurable / infinite | By count or memory |
-| **Replay** | No | Yes | Yes | Yes (up to MAXLEN) |
-| **Multiple consumers** | Competing (one gets it) | Fan-out (2MB/s shared or enhanced) | Consumer groups (independent) | Consumer groups |
-| **Throughput** | ~3K msg/s (FIFO), unlimited (Standard) | Per shard: 1MB/s in, 2MB/s out | 1M+ msg/s (horizontally) | ~100K–500K msg/s |
-| **Latency** | ~1–10ms | ~70ms | ~2–10ms | ~0.1–1ms |
-| **Exactly-once** | FIFO only | No (at-least-once) | Yes (transactions) | No (at-least-once) |
-| **Scaling** | Automatic | Manual shard split/merge | Add partitions/brokers | Vertical or cluster |
-| **Managed** | Fully (AWS) | Fully (AWS) | Self-managed or MSK/Confluent | Self-managed or ElastiCache |
-| **Cost model** | Per request | Per shard-hour + data | Infra cost | Redis instance cost |
-| **Ecosystem** | AWS-native | AWS-native | Kafka Connect, Flink, Spark | Redis ecosystem |
+| | Redis pub/sub | SNS | SQS | Kinesis | Kafka | Redis Streams |
+|--|---|---|---|---|---|---|
+| **Model** | Broadcast (fire-and-forget) | Push fan-out (fire-and-forget) | Queue (delete on ack) | Partitioned log | Partitioned log | Persistent log |
+| **Delivery guarantee** | At-most-once | At-least-once | At-least-once (FIFO: exactly-once) | At-least-once | At-least-once / exactly-once | At-least-once |
+| **Persistence** | None | None (SNS) | Yes (up to 14 days) | Yes (24hr–365 days) | Yes (infinite) | Yes (memory-bound) |
+| **Replay** | No | No | No | Yes (within retention) | Yes (any offset) | Yes (up to MAXLEN) |
+| **Consumer model** | All subscribers get all messages | All subscriptions get pushed | Competing (one gets each msg) | Consumer groups per shard | Independent consumer groups | Consumer groups |
+| **Ordering** | Per channel, FIFO | No (FIFO SNS: per group) | No (FIFO SQS: per group) | Per shard | Per partition | Global (single stream) |
+| **Max TPS (writes)** | ~1M msg/sec (single node) | Standard: ~unlimited; FIFO: 300/sec (3K batched) | Standard: ~unlimited; FIFO: 300/sec (3K batched) | 1K records/sec per shard (1MB/s) | 1M+ msg/sec (cluster) | ~500K msg/sec |
+| **Max TPS (reads)** | Broadcast to all simultaneously | Push (no poll) | ~unlimited (Standard); 300/s (FIFO) | 2MB/s per shard (5 reads/sec polling; enhanced fan-out: 2MB/s per consumer) | Limited by partition count × consumer throughput | ~500K msg/sec |
+| **Latency** | <1ms | ~10ms–1s | ~1–10ms | Polling: ~200ms; Enhanced fan-out: ~70ms | ~2–10ms (tunable to ~0.5ms) | <1ms |
+| **Max message size** | 512MB (Redis limit; use <1MB) | 256KB | 256KB | 1MB | 1MB default (configurable to ~10MB) | 512MB (Redis limit) |
+| **Subscriber offline** | Message lost | Delivered to endpoint (SQS buffers it) | Stays in queue (visibility timeout) | Consumer reads when ready | Consumer reads at own pace | Pending until acked |
+| **Fan-out to N services** | Yes (all subscribers) | Yes (push to all subscriptions) | No (one consumer gets it) | Via enhanced fan-out (each consumer: 2MB/s per shard) | Via consumer groups (each group: full copy) | Via consumer groups |
+| **Filtering** | Pattern subscriptions (PSUBSCRIBE) | Filter policies per subscription (on message attributes) | No native filtering | No native filtering | No native (use Kafka Streams or consumer-side) | No native |
+| **Dead letter** | No | Via SQS DLQ on subscription | Yes (DLQ after N failures) | No built-in | No built-in (handle in consumer) | Via XPENDING + XCLAIM |
+| **Scaling** | Vertical (cluster mode for sharding) | Automatic | Automatic | Manual shard add/split or on-demand | Add brokers + partitions | Vertical or Redis Cluster |
+| **Managed** | Self-managed or ElastiCache | Fully managed (AWS) | Fully managed (AWS) | Fully managed (AWS) | Self-managed / MSK / Confluent | Self-managed or ElastiCache |
+| **Cost model** | Redis instance | Per publish + per delivery | Per request | Per shard-hour + PUT payload | Infra (brokers, storage) | Redis instance |
+| **Cross-account/region** | No | Yes (SNS native) | Yes (via SQS policy) | No (same account) | Manual (MirrorMaker) | No |
+| **Best for** | Real-time broadcast, presence, live updates | AWS fan-out, trigger multiple services | Task queue, job dispatch | AWS streaming analytics | High-throughput event log, stream processing | Low-latency stream with replay |
 
 ---
 
 ## Deep Dive: Each Tool
+
+### Redis Pub/Sub — when it shines
+
+**Core insight**: Redis pub/sub is a real-time notification bus. Zero persistence. If no one is subscribed when you publish, the message is gone forever. Use it when dropping a message is acceptable.
+
+```
+Use Redis pub/sub when:
+  ✅ Real-time broadcast where missing is acceptable — live score updates, chat typing indicators
+  ✅ Presence: notify friends when user comes online
+  ✅ Cache invalidation: broadcast "key X changed" to all app servers
+  ✅ Live commentary, realtime claps — readers expect live, don't need history
+  ✅ Sub-millisecond fan-out to all connected servers
+
+Don't use Redis pub/sub when:
+  ❌ Any message must not be lost — use Redis Streams or Kafka
+  ❌ Consumer offline for even 1 second — messages during that window are lost
+  ❌ Need to know how many messages were missed — no offset tracking
+  ❌ Need consumer groups (competing consumers) — all subscribers get all messages
+  ❌ Need filtering — all subscribers on a channel get everything
+```
+
+**Commands:**
+```bash
+# Publisher
+PUBLISH live:match:icc_final '{"ball":42,"runs":4,"commentary":"FOUR!"}'
+
+# Subscriber (blocking, receives all messages on channel)
+SUBSCRIBE live:match:icc_final
+
+# Pattern subscription (wildcard)
+PSUBSCRIBE live:match:*     ← receives messages on ALL match channels
+PSUBSCRIBE cache:invalidate:user:*
+
+# Unsubscribe
+UNSUBSCRIBE live:match:icc_final
+```
+
+**What happens at scale: fan-out cost**
+```
+1 Redis PUBLISH to channel with 1000 subscribers:
+  Redis loops through all 1000 subscriber connections
+  Sends message to each — sequential in Redis's single thread
+  1000 × 1KB message = 1MB sent per publish
+
+At 10K subscribers × 100 publishes/sec:
+  Redis sending 1GB/sec of data — network saturation risk
+
+Solution: SSE/WebSocket servers as subscribers (not end clients directly)
+  Redis → 5 SSE servers (each subscribed)
+  Each SSE server → 2K connected end clients
+  Redis fan-out: 5 sends (fast)
+  SSE servers fan-out: 2K each (parallel)
+```
+
+**Java with Jedis:**
+```java
+// Subscriber (runs in dedicated thread — SUBSCRIBE is blocking)
+Jedis jedis = new Jedis("localhost", 6379);
+jedis.subscribe(new JedisPubSub() {
+    @Override
+    public void onMessage(String channel, String message) {
+        // broadcast to all SSE/WebSocket clients on this server
+        sseClients.forEach(client -> client.send(message));
+    }
+}, "live:match:icc_final");
+
+// Publisher (separate Jedis connection — subscriber connection is dedicated)
+Jedis publisher = new Jedis("localhost", 6379);
+publisher.publish("live:match:icc_final", json);
+```
+
+**Key limitation: subscriber connection is dedicated**
+```
+Once you call SUBSCRIBE, that connection can ONLY subscribe/unsubscribe.
+You need a SEPARATE connection for publishing.
+This is unlike Redis Streams where you can mix XADD and XREAD on same connection.
+```
+
+---
+
+### SNS — when it shines
+
+**Core insight**: SNS is the AWS fan-out glue. It doesn't store messages — it pushes them immediately to all subscriptions. The value is connecting multiple AWS services to one event source without coupling them.
+
+```
+Use SNS when:
+  ✅ Fan-out to multiple AWS services from one publish (SQS + Lambda + HTTP + email)
+  ✅ Decouple producers from consumer infrastructure (producer doesn't know who consumes)
+  ✅ Cross-account event delivery (SNS supports cross-account subscriptions natively)
+  ✅ Simple notification: SMS, email, mobile push (APNs/FCM) directly from SNS
+  ✅ Filter messages per subscriber (each SQS subscription sees only matching events)
+  ✅ You don't need replay — SNS+SQS gives you the buffer/replay via SQS
+
+Don't use SNS when:
+  ❌ You need replay of past messages — SNS has no storage
+  ❌ High-throughput ordered stream — use Kinesis/Kafka
+  ❌ Consumer needs to process at own pace (pull model) — SNS pushes, use SQS behind it
+  ❌ FIFO at > 300 TPS — FIFO SNS is limited, use Kafka
+```
+
+**SNS Standard vs FIFO:**
+```
+Standard SNS:
+  - At-least-once delivery (rare duplicate possible)
+  - No ordering guarantee
+  - Unlimited TPS
+  - Subscribers: SQS (Standard or FIFO), Lambda, HTTP, Email, SMS, Mobile Push
+
+FIFO SNS:
+  - Exactly-once delivery (5-min dedup window by MessageDeduplicationId)
+  - Ordered per MessageGroupId (like Kafka partition key)
+  - 300 TPS (3000 with batching)
+  - Subscribers: SQS FIFO ONLY (no Lambda, no HTTP directly)
+  - Use when: order matters and exactly-once matters (financial events, inventory)
+```
+
+**Filter policies — the killer SNS feature:**
+```json
+// SNS Topic: order-events  (publishes ALL order events)
+
+// Subscription A (Fraud Service SQS) — only high-value orders
+{
+  "amount": [{"numeric": [">=", 1000]}],
+  "status": ["placed"]
+}
+
+// Subscription B (Email Service SQS) — all status changes
+{
+  "status": ["placed", "shipped", "delivered", "cancelled"]
+}
+
+// Subscription C (Analytics Lambda) — no filter = gets everything
+{}
+```
+
+Each SQS queue only receives messages matching its filter. SNS evaluates filters before delivery — non-matching messages never reach that subscription.
+
+**SNS + SQS fan-out (the canonical pattern):**
+```
+order.placed event
+      ↓
+  SNS Topic
+  ├── SQS: FraudCheckQueue    → Fraud Lambda (processes async, retries via DLQ)
+  ├── SQS: InventoryQueue     → Inventory Service (at-least-once, deduped)
+  ├── SQS: EmailQueue         → Email Service (retry 3x, DLQ for failures)
+  ├── Lambda: RealTimeMetrics → immediate execution, no queue
+  └── HTTP: WebhookEndpoint   → partner notification
+
+Why SQS behind SNS (not Lambda directly for all)?
+  SQS absorbs burst — if Fraud Lambda is slow, queue buffers
+  SQS provides retry + DLQ — SNS delivery failure handling per-subscription
+  SQS decouples consumer pace from publish rate
+```
+
+**Limits to know:**
+```
+Message size:    256KB (hard limit — larger payload: store in S3, SNS carries S3 key)
+Subscriptions:   12.5M per topic
+Topics per account: 100K default (soft limit, requestable)
+FIFO TPS:        300/sec (3000 batched) — hard limit, cannot increase
+Standard TPS:    ~unlimited (30M+ messages/sec at AWS scale)
+Delivery retry:  HTTP endpoints: exponential backoff up to 23 times over 23 hours
+                 SQS: handled by SQS (not SNS)
+                 Lambda: 2 retries (Lambda async invocation)
+```
+
+---
 
 ### SQS — when it shines
 
@@ -345,44 +543,86 @@ This is equivalent to Kafka's consumer group offset tracking but per-message
 ## Decision Framework (The Real Interview Answer)
 
 ```
-Question: What messaging system would you use for X?
+Q: What messaging system for X?
 
-Step 1: Queue or Log?
-  Task execution (one consumer processes, done)  → SQS
-  Event processing (multiple consumers, replay)  → Kafka / Kinesis / Redis Streams
+Step 1: Can the message be lost if consumer is offline?
+  YES → Redis pub/sub (fire-and-forget, sub-ms broadcast)
+  NO  → continue
 
-Step 2: If Log — which one?
+Step 2: Task queue (one consumer, no replay) or event log (many consumers, replay)?
+  Task queue  → SQS
+  Event log   → continue
 
-  Max throughput + long retention + exactly-once + ecosystem?
-    → Kafka (or MSK on AWS)
+Step 3: Need fan-out to multiple independent services without replay?
+  YES + AWS + simple → SNS + SQS per service
+  YES + need replay  → Kafka consumer groups (each group gets full copy)
 
-  AWS-managed + moderate scale + AWS ecosystem (Lambda, Firehose)?
-    → Kinesis
+Step 4: Need replay + durable log — which one?
+  Sub-ms latency, short retention, already have Redis  → Redis Streams
+  AWS-native, moderate scale, Lambda/Firehose ecosystem → Kinesis
+  High throughput, exactly-once, Flink/Spark ecosystem  → Kafka (or MSK)
 
-  Sub-millisecond latency + already have Redis + short retention?
-    → Redis Streams
+Step 5: At what scale does the choice change?
+  < 1K msg/sec, AWS-only            → SNS + SQS (zero ops)
+  1K–100K msg/sec, AWS-only         → Kinesis (managed, shard math is simple)
+  > 100K msg/sec or non-AWS         → Kafka (cheaper, more powerful)
+  Broadcast to live connections      → Redis pub/sub (not Kafka)
+  Broadcast + must not miss          → Redis Streams or Kafka + SSE server layer
+```
 
-  Pure fan-out on AWS (SNS → multiple SQS queues)?
-    → SNS + SQS (simpler than Kafka for basic fan-out)
+**The SNS vs Kafka fan-out distinction:**
+```
+SNS fan-out: all subscriptions get the message → each SQS queue is independent
+  Good when: each service processes the event differently (email + fraud + analytics)
+  Bad when:  you need > 300 TPS ordered (FIFO SNS limit), or replay
 
-Step 3: At Netflix scale?
-  Kafka. Netflix uses Kafka (Keystone) as their central event bus.
-  200B+ events/day, multiple consumer groups, Flink jobs consuming same stream.
-  Kinesis would be 10× more expensive at that scale.
+Kafka fan-out: multiple consumer groups, each reads independently
+  Good when: same event, different processing, need replay, high throughput
+  Bad when:  simple AWS glue — Kafka is overkill for 5 services at low volume
+
+Rule: SNS+SQS before Kafka. Migrate to Kafka when:
+  → You need replay for catch-up (new service needs historical events)
+  → You need ordered processing > FIFO SNS limit
+  → You need exactly-once end-to-end
+  → You need stream processing (Flink consuming same topic)
 ```
 
 ---
 
 ## Scale Numbers to Quote in Interviews
 
-| System | Throughput | Latency | Retention |
-|--------|-----------|---------|-----------|
-| SQS Standard | ~unlimited (distributed) | 1–10ms | up to 14 days |
-| SQS FIFO | 3,000 msg/s (batched) | 1–10ms | up to 14 days |
-| Kinesis (per shard) | 1 MB/s write, 2 MB/s read | ~70ms | 24hr–1yr |
-| Kafka (per partition) | ~10–50 MB/s | 2–10ms | configurable/infinite |
-| Kafka cluster | 1M+ msg/s | 2–10ms | infinite (compacted) |
-| Redis Streams | 100K–500K msg/s | <1ms | memory-bound |
+| System | Write TPS | Read TPS | Latency | Retention | Max msg size |
+|--------|-----------|----------|---------|-----------|--------------|
+| Redis pub/sub | ~1M msg/sec | Broadcast (push) | <1ms | None | 512MB (use <1MB) |
+| SNS Standard | ~unlimited | Push to subscribers | ~10ms–1s | None | 256KB |
+| SNS FIFO | 300/sec (3K batched) | Push (FIFO) | ~10ms–1s | None | 256KB |
+| SQS Standard | ~unlimited | ~unlimited | 1–10ms | up to 14 days | 256KB |
+| SQS FIFO | 300/sec (3K batched) | 300/sec | 1–10ms | up to 14 days | 256KB |
+| Kinesis (per shard) | 1K records/sec, 1MB/s | 5 reads/sec, 2MB/s (shared) or 2MB/s per consumer (enhanced) | Polling: ~200ms; Enhanced: ~70ms | 24hr–365 days | 1MB |
+| Kafka (per partition) | ~50MB/s | Consumer-rate | 2–10ms (tunable <1ms) | Infinite | 1MB default |
+| Kafka cluster | 1M+ msg/sec | 1M+ msg/sec | 2–10ms | Infinite | Configurable |
+| Redis Streams | ~500K msg/sec | ~500K msg/sec | <1ms | Memory-bound (MAXLEN) | 512MB (use <1MB) |
+
+**Kinesis shard math (must know):**
+```
+Need to handle 50MB/sec ingest → 50 shards (1MB/s each)
+5 consumer services each need full 50MB/s → 250MB/s total read
+  Shared polling: 50 shards × 2MB/s = 100MB/s → NOT enough for 5 consumers
+  Enhanced fan-out: each consumer gets 2MB/s per shard = 100MB/s per consumer → OK
+  Cost: enhanced fan-out adds $0.015/shard-hour per consumer
+
+Provisioned vs On-Demand:
+  Provisioned: you set shard count, pay per shard-hour
+  On-Demand:   auto-scales, pay per GB in/out (2× cost but zero capacity planning)
+```
+
+**SNS FIFO hard limit: 300 TPS**
+```
+Cannot increase this limit (it is hard, not soft).
+If you need FIFO ordered delivery > 300 TPS → use Kafka.
+If you need exactly-once delivery at high TPS → Kafka transactions.
+SNS FIFO + SQS FIFO is the serverless exactly-once fan-out at low volume.
+```
 
 ---
 
