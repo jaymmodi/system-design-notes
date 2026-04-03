@@ -365,6 +365,282 @@ Q5: Simple key-value, extreme scale, low latency?
 
 ---
 
+---
+
+## DynamoDB Indexes — Deep Dive
+
+### DynamoDB data model first
+
+Every item needs a partition key (PK). Optionally a sort key (SK).
+
+```
+Table: Orders
+  PK: userId       ← hashed → determines which partition stores the item
+  SK: orderId      ← sorted  → items within a partition are ordered by SK
+
+Physical storage:
+  Partition (hash of PK="USER#123"):
+    SK="ORDER#001" → { status: "pending",  amount: 25.00, createdAt: "2024-01-01" }
+    SK="ORDER#002" → { status: "shipped",  amount: 99.00, createdAt: "2024-01-03" }
+    SK="ORDER#003" → { status: "pending",  amount: 10.00, createdAt: "2024-01-05" }
+    ← sorted by SK within the partition
+
+  Partition (hash of PK="USER#456"):
+    SK="ORDER#010" → { status: "completed", amount: 50.00, createdAt: "2024-01-02" }
+    ...
+```
+
+You can only query by PK (required, exact match) + optionally filter/range on SK.
+Any other access pattern → you need an index.
+
+---
+
+### LSI — Local Secondary Index
+
+**Same partition key, different sort key. Sorted differently within each partition.**
+
+```
+Base table:         PK=userId, SK=orderId
+LSI (ByAmount):     PK=userId, SK=amount    ← same PK, different SK
+LSI (ByCreatedAt):  PK=userId, SK=createdAt ← same PK, different SK
+```
+
+Physical storage — within the same partition, an additional sorted list:
+
+```
+Partition (PK="USER#123"):
+
+  Base table sorted by orderId:            LSI sorted by amount:
+    ORDER#001 → {amount:25, status:pending}   amount:10.00 → ORDER#003
+    ORDER#002 → {amount:99, status:shipped}   amount:25.00 → ORDER#001
+    ORDER#003 → {amount:10, status:pending}   amount:99.00 → ORDER#002
+                                              ↑ same partition, different sort order
+```
+
+Query example:
+```java
+// "Get all orders for user123, sorted by amount ascending"
+// Base table can't do this — orderId is the SK, not amount
+// LSI can:
+QueryRequest.builder()
+    .tableName("Orders")
+    .indexName("ByAmount")
+    .keyConditionExpression("userId = :uid")
+    .expressionAttributeValues(Map.of(":uid", AttributeValue.fromS("USER#123")))
+    .build();
+// Returns: ORDER#003 (10), ORDER#001 (25), ORDER#002 (99) ← sorted by amount
+```
+
+LSI rules:
+```
+✓ Same partition key as base table (required — "local" to the partition)
+✓ Different sort key
+✓ Strongly consistent reads (data is in the same partition, same nodes)
+✓ No extra WCU cost for writes (same partition write)
+✗ Must define at TABLE CREATION TIME — cannot add later
+✗ Shares partition storage with base table (10GB per partition limit applies)
+✗ Max 5 LSIs per table
+✗ Only useful if you always filter by the same partition key (userId must be known)
+```
+
+---
+
+### GSI — Global Secondary Index
+
+**Different partition key AND/OR different sort key. Completely separate storage. Spans all partitions.**
+
+```
+Base table:       PK=userId,  SK=orderId
+GSI (ByStatus):   PK=status,  SK=createdAt  ← totally different keys
+```
+
+Physical storage — AWS maintains a separate index table, async-replicated:
+
+```
+Base table partitions:            GSI partitions (separate storage):
+  PK=USER#123:                      PK=pending (hash of "pending"):
+    ORDER#001: pending, 2024-01-01    2024-01-01 → {userId:USER#123, orderId:ORDER#001, amount:25}
+    ORDER#002: shipped, 2024-01-03    2024-01-05 → {userId:USER#123, orderId:ORDER#003, amount:10}
+    ORDER#003: pending, 2024-01-05    2024-01-07 → {userId:USER#789, orderId:ORDER#020, amount:75}
+  PK=USER#456:
+    ORDER#010: completed, 2024-01-02  PK=shipped (hash of "shipped"):
+                                        2024-01-03 → {userId:USER#123, orderId:ORDER#002, amount:99}
+                                        ...
+                                      ← async replicated from base table writes
+```
+
+Query example:
+```java
+// "Get all pending orders across ALL users, sorted by date"
+// Base table can't — you'd need to scan all partitions
+// GSI can:
+QueryRequest.builder()
+    .tableName("Orders")
+    .indexName("ByStatus")
+    .keyConditionExpression("#s = :status AND createdAt > :since")
+    .expressionAttributeNames(Map.of("#s", "status"))
+    .expressionAttributeValues(Map.of(
+        ":status", AttributeValue.fromS("pending"),
+        ":since",  AttributeValue.fromS("2024-01-01")
+    ))
+    .build();
+```
+
+GSI rules:
+```
+✓ Any attribute as PK (even one that doesn't exist on all items — sparse GSI)
+✓ Can add AFTER table creation
+✓ No partition storage limit (separate storage from base table)
+✓ Max 20 GSIs per table
+✗ Eventually consistent only (async replication — slight lag after writes)
+✗ Extra WCU cost: write to base table + write to each GSI
+✗ GSI PK must be exact match — range only on GSI SK
+✗ NOT strongly consistent (unlike LSI)
+```
+
+Write cost with GSI:
+```
+1 write to Orders table                = 1 WCU
++ 1 write to ByStatus GSI             = 1 WCU
++ 1 write to ByCreatedAt GSI          = 1 WCU
+─────────────────────────────────────────────
+Total for 1 item write with 2 GSIs    = 3 WCU
+```
+
+---
+
+### Sparse GSI — powerful pattern
+
+GSI only indexes items that have the GSI partition key attribute.
+Items missing the attribute are simply absent from the GSI.
+
+```java
+// Only urgent orders have the "urgent" attribute set
+// Most orders don't have it — they won't appear in the GSI
+
+// Item 1 (urgent):
+{  userId: "USER#123", orderId: "ORDER#001", urgent: "true", amount: 500 }
+// ↑ appears in ByUrgent GSI
+
+// Item 2 (normal):
+{  userId: "USER#456", orderId: "ORDER#010", amount: 25 }
+// ↑ NOT in ByUrgent GSI — no "urgent" attribute
+
+// Result: GSI only contains the small subset of urgent orders
+// Very cheap to scan — only urgent items indexed
+QueryRequest.builder()
+    .tableName("Orders")
+    .indexName("ByUrgent")
+    .keyConditionExpression("urgent = :u")
+    .expressionAttributeValues(Map.of(":u", AttributeValue.fromS("true")))
+    .build();
+```
+
+---
+
+### LSI vs GSI — side by side
+
+| | LSI | GSI |
+|---|---|---|
+| Partition key | Same as base table | Any attribute |
+| Sort key | Different from base table | Any attribute |
+| When to create | Table creation only | Anytime |
+| Consistency | Strongly consistent ✓ | Eventually consistent only |
+| Write cost | Free (same partition write) | Extra WCU per GSI |
+| Storage | Shared with base partition (10GB limit) | Separate (no limit) |
+| Use when | Same user/entity, query sorted differently | Cross-entity queries, different access pattern |
+| Max per table | 5 | 20 |
+
+---
+
+### How DynamoDB indexes compare to SQL B-tree indexes
+
+```
+SQL B-tree index:
+
+  Heap file (table rows, unordered pages):
+    Page 1: [row(id=5)][row(id=2)][row(id=8)]  ← inserted order
+    Page 2: [row(id=1)][row(id=9)]
+
+  B-tree index on status:
+    Root
+    ├── "completed" → Leaf: [page1:slot3, page2:slot1, ...]  ← pointers to heap
+    ├── "pending"   → Leaf: [page1:slot1, page2:slot2, ...]
+    └── "shipped"   → Leaf: [page1:slot2, ...]
+
+  On write:  update heap page + walk B-tree + insert pointer into leaf
+  On read:   walk B-tree O(log n) → fetch heap page via pointer
+  Consistency: always synchronous — index always matches table
+```
+
+```
+DynamoDB GSI:
+
+  Base table partitions (distributed across nodes):
+    Node A: PK=USER#123 items (sorted by SK=orderId)
+    Node B: PK=USER#456 items
+    Node C: PK=USER#789 items
+
+  GSI (ByStatus) — separate partition set on separate nodes:
+    Node X: GSI_PK=pending  items (sorted by GSI_SK=createdAt)
+    Node Y: GSI_PK=shipped  items
+    Node Z: GSI_PK=completed items
+
+  On write to base table:
+    1. Write to base table partition (Node A) — synchronous, client acked
+    2. Async replication stream → GSI partition (Node X) — eventual
+       ← client already got success before GSI updated
+
+  On GSI read: goes to GSI partition directly (Node X), may be slightly stale
+```
+
+Key differences:
+
+| | SQL B-tree | DynamoDB LSI | DynamoDB GSI |
+|---|---|---|---|
+| Consistency | Always synchronous | Synchronous (same partition) | Async — eventually consistent |
+| Read after write | Always sees latest | Always sees latest | May see stale data |
+| Storage model | Pointer to heap row | Within partition storage | Completely separate storage |
+| Query flexibility | Range on any indexed column | Range on SK within known PK | Range on SK within known GSI PK |
+| Cross-partition query | Full table scan | No (PK must be known) | Yes — GSI PK can be any attribute |
+| Write overhead | Update index tree synchronously | None extra | Extra WCU per GSI |
+| Add after creation | Yes (with lock / concurrent build) | No | Yes |
+
+The fundamental gap: **SQL indexes are fully consistent and transparent. DynamoDB GSI is eventually consistent and costs extra WCUs.** LSI is the only DynamoDB index that matches SQL consistency guarantees — but only within a single partition.
+
+---
+
+### Single-table design — GSI as the access pattern engine
+
+DynamoDB best practice: one table, multiple entity types, multiple GSIs for each access pattern.
+
+```
+Table: AppData
+  PK: pk    (overloaded — holds entity type + ID)
+  SK: sk    (overloaded — holds relationship + ID)
+
+Items:
+  PK=USER#123,    SK=PROFILE#123   → user profile
+  PK=USER#123,    SK=ORDER#001     → order belonging to user
+  PK=ORDER#001,   SK=ITEM#A        → line item in order
+  PK=PRODUCT#999, SK=METADATA      → product
+
+GSI1: ByType
+  GSI_PK=entityType (USER / ORDER / PRODUCT)
+  GSI_SK=createdAt
+  → "get all orders created this week"
+
+GSI2: ByStatus
+  GSI_PK=status (pending / shipped / completed)
+  GSI_SK=createdAt
+  → "get all pending orders" (sparse — only items with status attribute)
+```
+
+Design rule: **figure out all access patterns BEFORE designing the table**.
+In SQL you add an index later. In DynamoDB, LSI is impossible to add later, and a missing GSI means a full Scan (expensive).
+
+---
+
 ## Interview Questions
 
 1. **How do indexes work internally?** B-tree: balanced tree, leaf nodes point to table rows. O(log N) lookup. Writes are slower (must update tree). Hash: O(1) equality, no range queries.
@@ -372,3 +648,7 @@ Q5: Simple key-value, extreme scale, low latency?
 3. **When would you choose MongoDB over PostgreSQL?** Flexible/evolving schema, document-centric data (no complex JOINs), horizontal write scaling needed.
 4. **What is a covering index?** All columns needed by a query are IN the index — avoids accessing the table entirely. Huge speedup for hot read queries.
 5. **How does DynamoDB handle hot partitions?** Adaptive capacity automatically moves throughput to busy partitions. But fundamentally: choose a high-cardinality partition key to avoid hot partitions.
+6. **LSI vs GSI?** LSI: same PK, different SK, strongly consistent, must define at creation, shares partition storage. GSI: any keys, eventually consistent, can add anytime, separate storage + extra WCU cost.
+7. **Why can't you add an LSI after table creation?** LSI data lives inside the partition storage alongside base table data. Retrofitting would require rewriting all existing partition data — DynamoDB doesn't support online LSI creation for this reason.
+8. **When does a GSI read return stale data?** When a write just happened to the base table and the async replication to the GSI hasn't completed yet (typically milliseconds). Use base table GetItem with strong consistency if you need latest data immediately after a write.
+9. **What is a sparse GSI?** A GSI where not all items have the GSI partition key attribute. Only items with that attribute are indexed — makes the GSI much smaller and cheaper to query. Useful for filtering a small subset (e.g. only "urgent" items).
