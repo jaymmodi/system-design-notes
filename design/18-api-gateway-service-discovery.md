@@ -1181,17 +1181,21 @@ Internet → API GW → VPC Link → NLB (private) → ECS tasks
 │  │  ┌──────────────────────────────────────────────────────────────┐  │   │
 │  │  │  PUBLIC SUBNETS (10.0.1.0/24, 10.0.2.0/24, 10.0.3.0/24)    │  │   │
 │  │  │                                                               │  │   │
+│  │  │  NAT Gateway (one per AZ — outbound only for ECS: ECR, APIs) │  │   │
+│  │  │  Internet Gateway attachment                                  │  │   │
+│  │  └──────────────────────────────────────────────────────────────┘  │   │
+│  │                                                                     │   │
+│  │  ┌──────────────────────────────────────────────────────────────┐  │   │
+│  │  │  PRIVATE SUBNETS (10.0.4.0/24, 10.0.5.0/24, 10.0.6.0/24)   │  │   │
+│  │  │                                                               │  │   │
 │  │  │  ┌─────────────────────────────────────────────────────┐    │  │   │
-│  │  │  │  NLB  (internal, NOT internet-facing)               │    │  │   │
+│  │  │  │  NLB  (internal=true, no public IPs)                │    │  │   │
+│  │  │  │  - VPC Link connects here via PrivateLink ENI        │    │  │   │
 │  │  │  │  - Static IPs per AZ (required by VPC Link)         │    │  │   │
 │  │  │  │  - TCP passthrough (no HTTP parsing overhead)        │    │  │   │
 │  │  │  │  - Health checks → ECS tasks on port 8080           │    │  │   │
 │  │  │  └──────────────┬──────────────────────────────────────┘    │  │   │
-│  │  └─────────────────┼─────────────────────────────────────────-─┘  │   │
-│  │                    │                                                │   │
-│  │  ┌─────────────────▼────────────────────────────────────────────┐  │   │
-│  │  │  PRIVATE SUBNETS (10.0.4.0/24, 10.0.5.0/24, 10.0.6.0/24)   │  │   │
-│  │  │                                                               │  │   │
+│  │  │                 │                                             │  │   │
 │  │  │  ECS Cluster (Fargate)                                        │  │   │
 │  │  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │  │   │
 │  │  │  │  Task (AZ-a) │  │  Task (AZ-b) │  │  Task (AZ-c) │       │  │   │
@@ -1199,8 +1203,6 @@ Internet → API GW → VPC Link → NLB (private) → ECS tasks
 │  │  │  │  port: 8080  │  │  port: 8080  │  │  port: 8080  │       │  │   │
 │  │  │  │  NO public IP│  │  NO public IP│  │  NO public IP│       │  │   │
 │  │  │  └──────────────┘  └──────────────┘  └──────────────┘       │  │   │
-│  │  │                                                               │  │   │
-│  │  │  NAT Gateway (outbound only — ECR image pulls, etc.)         │  │   │
 │  │  │                                                               │  │   │
 │  │  │  ┌────────────────────────────────────────────────────────┐  │  │   │
 │  │  │  │  DATA LAYER (private, no route to internet)            │  │  │   │
