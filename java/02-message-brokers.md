@@ -651,6 +651,137 @@ Your Kinesis → Kafka bridge answer:
 
 ---
 
+---
+
+## Fan-out Deep Dive
+
+Fan-out = one message published → multiple receivers each get a copy.
+
+### Fan-out Comparison
+
+| | Redis pub/sub | SNS | Kafka | Kinesis | SQS | Redis Streams |
+|---|---|---|---|---|---|---|
+| **Fan-out model** | All connected subscribers simultaneously | Push to all subscriptions | Each consumer group gets full copy independently | Each consumer group reads independently per shard | One consumer gets it (no fan-out) | Each consumer group independently |
+| **Receiver offline** | Message lost | SQS buffers it; Lambda/HTTP retried 23x | Consumer reads when back online, no data loss | Consumer reads when back online (within retention) | Stays in queue (visibility timeout) | Pending in stream until acked |
+| **Slow consumer** | No effect on others (fire and forget) | No effect (push doesn't wait) | Slow group falls behind, others unaffected | Slow group falls behind, others unaffected | Queue depth grows | Other groups unaffected |
+| **N independent services** | All N get it if connected | All N subscriptions pushed | N consumer groups, each with own offset | N consumer groups, each reads same shard | N separate queues needed (via SNS) | N consumer groups |
+| **Fan-out cost** | Free (one Redis publish) | Per delivery per subscription | Free (consumers pull) | Enhanced fan-out: $0.015/shard-hr per consumer | N × SQS cost | Free |
+| **Max receivers** | Unlimited (network bound) | 12.5M subscriptions per topic | Unlimited consumer groups | Shared: 5 reads/sec per shard; Enhanced: unlimited | Unlimited queues behind SNS | Unlimited consumer groups |
+| **Ordering per receiver** | FIFO per channel | No (FIFO SNS: per group) | FIFO per partition per group | FIFO per shard per group | No (FIFO queue: per group) | FIFO (global) |
+| **Fan-out to live clients** | Native — built for this | No (pushes to AWS services only) | Via intermediary (Kafka → SSE server) | Via intermediary | No | Via intermediary |
+
+---
+
+### The Three Fan-out Patterns
+
+#### Pattern 1 — Broadcast to live connections (Redis pub/sub)
+```
+Use when: 1M users watching same live match, realtime claps, presence updates
+          Losing a message is OK (client will get next update)
+
+Publisher → Redis PUBLISH match:final <update>
+                 ↓ simultaneously
+         SSE Server A  SSE Server B  SSE Server C
+         (10K clients) (10K clients) (10K clients)
+
+SSE servers are the Redis subscribers — not individual clients directly.
+Redis fan-out: 3 sends. Each server fans out to 10K clients.
+```
+
+#### Pattern 2 — Fan-out to independent services (SNS + SQS)
+```
+Use when: order.placed → email + fraud + inventory + analytics
+          Each service must process every event, can't miss any
+
+order.placed event
+      ↓
+  SNS Topic
+  ├── SQS: EmailQueue      → Email Service      (buffers, retries)
+  ├── SQS: FraudQueue      → Fraud Service
+  ├── SQS: InventoryQueue  → Inventory Service
+  └── Lambda: Metrics      → immediate, no buffer needed
+
+Each SQS queue is independent — Fraud being slow doesn't affect Email.
+Retry + DLQ per service. Zero data loss.
+```
+
+#### Pattern 3 — Fan-out with replay (Kafka consumer groups)
+```
+Use when: > 5 services, new services need to catch up from history,
+          stream processing (Flink), high throughput, exactly-once
+
+Topic: user-events  [P0][P1][P2]
+
+Consumer Group "billing":   offset 10,450
+Consumer Group "analytics": offset 10,448  ← 2 behind, catching up
+Consumer Group "ml-train":  offset 0       ← new service replaying history
+
+New service joins → starts from offset 0, replays all history.
+No re-publish needed. SNS can never do this.
+```
+
+---
+
+### Decision: Which Fan-out for Your Use Case?
+
+```
+Are receivers live TCP connections (WebSocket/SSE clients)?
+  YES → Redis pub/sub (only tool built for this)
+
+Are receivers AWS services at volume < 300 TPS ordered?
+  YES → SNS (simplest, zero ops, filter policies per subscription)
+
+Are receivers independent services needing guaranteed delivery + replay?
+  YES + low volume  → SNS + SQS per service
+  YES + high volume → Kafka consumer groups
+
+Does a new service need to replay historical events?
+  YES → Kafka (SNS cannot replay, SNS+SQS cannot catch up from the past)
+
+Do consumers process at wildly different speeds?
+  YES → Kafka or SNS+SQS (slow consumer falls behind independently, others unaffected)
+  NO (fire-and-forget OK) → Redis pub/sub
+```
+
+---
+
+### The Three Anti-patterns
+
+```
+WRONG: Kafka for fan-out to live WebSocket clients
+  Kafka poll interval (5–100ms) + processing = too slow for live UX
+  Fix: Kafka → Redis pub/sub → WebSocket servers
+       (Kafka for durability, Redis for last-mile delivery)
+
+WRONG: Redis pub/sub for service-to-service fan-out
+  Service B restarts 30 seconds → misses 30 seconds of events → silent data loss
+  Fix: SNS + SQS (SQS buffers during restart, retries on failure)
+
+WRONG: SNS FIFO for > 300 TPS ordered fan-out
+  FIFO SNS hard limit: 300 TPS — cannot increase, ever
+  Fix: Kafka partitioned by key
+```
+
+### The hybrid at scale
+
+```
+Kafka + Redis pub/sub together (most common at scale):
+
+Kafka (durable backbone)
+    ↓ consumer reads events
+SSE/WebSocket servers
+    ↓ PUBLISH to Redis pub/sub
+Redis pub/sub
+    ↓ fan-out to all connected servers
+Live clients (millions)
+
+Kafka guarantees no event is lost and provides replay.
+Redis delivers to live connections in <1ms.
+Neither alone handles both requirements.
+```
+
+---
+
 ## Common Interview Questions
 
 **Q: How does Kafka guarantee ordering?**
