@@ -181,9 +181,12 @@ events.window(TumblingEventTimeWindows.of(Time.minutes(5)))
 events.window(SlidingEventTimeWindows.of(Time.minutes(10), Time.minutes(5)))
 
 // 3. Session Window — gap-based; closes after inactivity
-//    |--session1--|  gap  |--session2--|
+//    |--session1--|--30min gap--|--session2--|
+//    Session has NO fixed length — grows until no event arrives for 30min
+//    withGap() = inactivity timeout, NOT session max length
 events.window(EventTimeSessionWindows.withGap(Time.minutes(30)))
 // Use case: "user session" analytics — any activity within 30min = same session
+// To cap session length: use ProcessWindowFunction to check window.getEnd() - window.getStart()
 
 // 4. Global Window with Trigger
 //    Accumulate until custom trigger fires
