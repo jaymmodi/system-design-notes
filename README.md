@@ -18,8 +18,8 @@ system-design-notes/
 │   ├── 05-load-balancing.md
 │   ├── 06-database-sharding.md
 │   ├── 07-replication.md
-│   ├── 10-redis.md
-│   ├── 11-message-queues.md
+│   ├── 10-redis.md                              — Redis deep dive: data structures, patterns, persistence, cluster + commands cheatsheet
+│   ├── 11-message-queues.md                     — Redis Streams vs Kafka vs Kinesis vs SQS vs SNS: mental models, deep dives, Java examples, fan-out patterns
 │   ├── 12-graph-databases.md
 │   ├── 13-search-engines.md
 │   ├── 14-rate-limiting.md
@@ -50,9 +50,7 @@ system-design-notes/
 │   └── 31-red-black-trees.md
 │
 └── java/                             — Java language deep dives
-    ├── 01-concurrency.md             — CountDownLatch, CyclicBarrier, Semaphore, ExecutorService, Virtual Threads, CompletableFuture
-    ├── 02-message-brokers.md         — Redis Streams vs Kafka vs Kinesis vs SQS: mental models, when to use which
-    └── 03-redis-commands-cheatsheet.md — all Redis commands by type: strings, hashes, sets, ZSETs, streams, bitmaps, HLL, Lua
+    └── 01-concurrency.md             — CountDownLatch, CyclicBarrier, Semaphore, ExecutorService, Virtual Threads, CompletableFuture
 ```
 
 ---
