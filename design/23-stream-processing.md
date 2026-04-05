@@ -273,7 +273,288 @@ public class FraudDetectionFunction extends KeyedProcessFunction<String, Transac
 }
 
 // State backends: HashMapStateBackend (memory), RocksDBStateBackend (disk, for large state)
-env.setStateBackend(new RocksDBStateBackend("s3://bucket/checkpoints", true));
+env.setStateBackend(new EmbeddedRocksDBStateBackend(true)); // true = incremental checkpoints
+env.getCheckpointConfig().setCheckpointStorage("s3://bucket/checkpoints");
+```
+
+---
+
+## RocksDB State Backend — Deep Dive
+
+### How Checkpointing to S3 Works
+
+RocksDB state lives on the **local disk** of each TaskManager. S3 is where checkpoints are durably persisted — it is NOT where reads/writes happen during normal processing.
+
+```
+Normal operation:
+  Event arrives → Flink operator → reads/writes RocksDB on LOCAL DISK (fast, ~µs)
+                                    (S3 is NOT involved per-event)
+
+Checkpoint triggered (every 60s by default):
+  Flink injects checkpoint barrier into stream
+  Each operator: RocksDB flushes memtable → creates SSTable snapshot
+  With incremental=true: only NEW/CHANGED SSTables uploaded to S3
+  (unchanged SSTables are referenced from previous checkpoint, not re-uploaded)
+
+On failure + restart:
+  TaskManagers download checkpoint from S3 → restore RocksDB locally → resume
+```
+
+```
+Local disk (TaskManager):          S3 (durable storage):
+┌──────────────────────┐          ┌──────────────────────────────┐
+│ RocksDB instance     │ ──────→  │ checkpoint-1/                │
+│  memtable (memory)   │ checkpoint│   sst-001.sst (full)        │
+│  SSTable files       │          │ checkpoint-2/                │
+│  (local SSD/HDD)     │          │   sst-002.sst (new only) ←  │
+└──────────────────────┘          │   ref: sst-001.sst          │
+  reads/writes here               └──────────────────────────────┘
+  during processing                 uploaded here during checkpoint
+```
+
+**Key implication:** if the TaskManager dies between checkpoints, events processed since the last checkpoint are replayed from Kafka. State changes since last checkpoint are lost and recomputed. This is why checkpoint interval matters — shorter = less replay on failure, more S3 writes.
+
+---
+
+### State Size Limitations
+
+```
+HashMapStateBackend (in-memory):
+  ❌ Limited to TaskManager JVM heap
+  ❌ State for ALL keys on a task slot must fit in heap
+  ✅ Fastest (pure memory access)
+  Use when: small state per key, low cardinality keyspace
+
+RocksDB (EmbeddedRocksDBStateBackend):
+  ✅ Bounded only by LOCAL DISK size (not heap)
+  ✅ RocksDB manages its own memory (block cache, write buffer) separately from JVM heap
+  ✅ Compaction keeps disk usage bounded (old SSTables merged and cleaned)
+  ❌ ~10x slower than HashMapStateBackend (disk I/O vs memory)
+  ❌ JVM heap still needed for Flink runtime, network buffers, non-state objects
+
+Practical limits:
+  State per TaskManager: up to disk size (TBs possible with NVMe)
+  Keys per TaskManager: millions — RocksDB handles this natively
+  Value size per key: up to GBs (but you'd need very wide rows — unusual)
+  Total state across cluster: disk size × number of TaskManagers
+```
+
+```java
+// Tune RocksDB memory to prevent OOM in JVM:
+RocksDBStateBackend backend = new RocksDBStateBackend(checkpointPath, true);
+
+// Bound total RocksDB memory usage (shared across all state on this TaskManager)
+RocksDBOptionsFactory optionsFactory = new DefaultConfigurableOptionsFactory();
+// In flink-conf.yaml:
+// state.backend.rocksdb.memory.managed: true          ← let Flink manage RocksDB memory
+// state.backend.rocksdb.memory.fixed-per-slot: 256mb  ← cap per task slot
+// state.backend.rocksdb.block.cache-size: 64mb
+// state.backend.rocksdb.writebuffer.size: 64mb
+// state.backend.rocksdb.writebuffer.count: 2
+```
+
+---
+
+### Schema Evolution — What Happens When You Change State?
+
+This is one of the trickiest operational challenges in stateful streaming.
+
+**Flink serializes state using its own `TypeSerializer`.** If you change the class structure, the deserializer may fail when reading old checkpoints.
+
+```
+Scenario: your state class is BehaviorProfile
+
+v1: class BehaviorProfile { long eventCount; }
+v2: class BehaviorProfile { long eventCount; String region; }  ← added field
+
+What happens on upgrade:
+  Old checkpoint has bytes for: [eventCount=42]
+  New deserializer expects:     [eventCount, region]
+  Result: CompatibilityResult.INCOMPATIBLE → job refuses to start from checkpoint
+  You are forced to start from scratch (TRIM_HORIZON in Kafka) and rebuild state
+```
+
+**Safe vs unsafe changes:**
+
+| Change | Safe? | Notes |
+|--------|-------|-------|
+| Add field with default value | ✅ with care | Use Avro/Kryo serializer, not POJO |
+| Remove field | ❌ | Breaks existing checkpoints |
+| Rename field | ❌ | Treated as remove + add |
+| Change field type | ❌ | Binary incompatible |
+| Add new state variable | ✅ | New variable starts empty; old variable reads fine |
+| Remove state variable | ✅ | Old bytes ignored |
+
+**How to handle schema evolution safely:**
+
+```java
+// Option 1: Use Avro serialization for state (schema evolution built-in)
+// Register Avro schema with Schema Registry — forward/backward compatible changes are safe
+
+// Option 2: Version your state explicitly
+public class BehaviorProfile {
+    private int schemaVersion = 2;  // bump on every change
+    private long eventCount;
+    private String region;  // added in v2
+
+    // Custom TypeSerializer reads schemaVersion first, handles old format
+}
+
+// Option 3: State migration via savepoint
+// 1. Take savepoint (manual checkpoint): flink savepoint <jobId> s3://savepoints/
+// 2. Stop job
+// 3. Write migration job: reads old state format → transforms → writes new state format
+// 4. Restart from savepoint with new schema
+```
+
+**Savepoint = your migration tool:**
+```
+Savepoint vs Checkpoint:
+  Checkpoint: automatic, managed by Flink, deleted when superseded
+  Savepoint:  manual, user-managed, never auto-deleted, survives job upgrades
+
+Workflow for schema migration:
+  1. flink savepoint <jobId>          ← snapshot state at a point in time
+  2. Stop job
+  3. Deploy new code (new schema)
+  4. flink run --fromSavepoint s3://savepoints/sp-123 my-job.jar
+     ↑ Flink checks TypeSerializer compatibility on start
+     ↑ If compatible → restore and continue
+     ↑ If not → fails fast, savepoint untouched (safe to retry)
+```
+
+---
+
+### Flink SQL for Stateful Streaming
+
+Yes — Flink SQL can express stateful streaming queries, including windowed aggregations, joins, and deduplication. The SQL compiles down to the same DataStream operators internally.
+
+```sql
+-- Flink SQL: tumbling window aggregation (stateful)
+SELECT
+    user_id,
+    TUMBLE_START(event_time, INTERVAL '5' MINUTE) AS window_start,
+    COUNT(*) AS view_count
+FROM user_events
+GROUP BY
+    user_id,
+    TUMBLE(event_time, INTERVAL '5' MINUTE);
+
+-- Session window (same withGap concept, SQL syntax)
+SELECT
+    user_id,
+    SESSION_START(event_time, INTERVAL '30' MINUTE) AS session_start,
+    SESSION_END(event_time, INTERVAL '30' MINUTE)   AS session_end,
+    COUNT(*) AS events_in_session
+FROM user_events
+GROUP BY
+    user_id,
+    SESSION(event_time, INTERVAL '30' MINUTE);
+
+-- Deduplication (stateful — Flink keeps last-seen per key)
+SELECT *
+FROM (
+    SELECT *,
+        ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY proctime DESC) AS rn
+    FROM orders
+)
+WHERE rn = 1;
+
+-- Stream-stream join (stateful — Flink buffers both sides in state)
+SELECT o.order_id, o.amount, p.payment_method
+FROM orders o
+JOIN payments p
+  ON o.order_id = p.order_id
+  AND p.payment_time BETWEEN o.order_time - INTERVAL '1' MINUTE
+                         AND o.order_time + INTERVAL '1' MINUTE;
+```
+
+**What SQL cannot express (must use DataStream API):**
+
+```
+SQL limitations:
+  ❌ Custom timer logic (e.g., "fire after 1hr of inactivity AND emit only if count > 5")
+  ❌ Complex fraud patterns (CEP — use Flink CEP library instead)
+  ❌ Side outputs (routing late events to a separate stream)
+  ❌ Arbitrary state shapes (SQL state is always window-scoped or join-buffered)
+  ❌ Custom watermark strategies per-partition
+
+Use DataStream API when:
+  → Business logic can't be expressed as GROUP BY / JOIN / ROW_NUMBER
+  → You need KeyedProcessFunction with multiple state variables
+  → You need timers, side outputs, or CEP patterns
+```
+
+---
+
+### Rescaling — How Flink Rebalances State
+
+This is where Flink fundamentally beats Spark.
+
+**How Flink keys state:**
+```
+Key: userId → hash → key group (0..maxParallelism-1)
+maxParallelism is set at job creation (default: 128)
+key groups are then assigned to task slots
+
+parallelism=4, maxParallelism=128:
+  Task 0: key groups [0..31]    (32 groups)
+  Task 1: key groups [32..63]   (32 groups)
+  Task 2: key groups [64..95]   (32 groups)
+  Task 3: key groups [96..127]  (32 groups)
+```
+
+**Rescaling up (parallelism 4 → 8):**
+```
+Before rescale:           After rescale (from savepoint):
+  Task 0: groups [0..31]   Task 0: groups [0..15]
+  Task 1: groups [32..63]  Task 1: groups [16..31]
+  Task 2: groups [64..95]  Task 2: groups [32..47]
+  Task 3: groups [96..127] Task 3: groups [48..63]
+                           Task 4: groups [64..79]
+                           Task 5: groups [80..95]
+                           Task 6: groups [96..111]
+                           Task 7: groups [112..127]
+
+Flink splits the key groups and ships the corresponding RocksDB state
+to the new task slots. State is NOT recomputed — just redistributed.
+```
+
+```java
+// Rescaling workflow:
+// 1. Take savepoint
+// 2. flink run --fromSavepoint s3://sp/... -p 8 my-job.jar
+//    ↑ -p 8 means new parallelism = 8
+//    Flink reads savepoint, redistributes key groups → job starts with 8 tasks
+
+// Critical: maxParallelism constrains maximum rescaling target
+// If maxParallelism=128, you can never scale beyond 128 parallelism
+// Set it conservatively high at job creation:
+env.setMaxParallelism(1024); // never set lower than your expected peak parallelism
+```
+
+**The Spark problem you called out:**
+```
+Spark Structured Streaming — why you CANNOT change parallelism for stateful queries:
+
+spark.sql.shuffle.partitions = 200  ← determines state partitioning
+
+State is stored per partition. Changing this value means:
+  - State for key "user-123" was in partition hash("user-123") % 200 = partition 47
+  - After change to 400 partitions: hash("user-123") % 400 = partition 247
+  - Partition 247 has no state for "user-123" → state is LOST
+
+Spark has no key group abstraction. State is tied directly to shuffle partition count.
+Changing shuffle.partitions = dropping all existing state = full recompute from beginning.
+
+Workarounds (all painful):
+  1. Choose partition count conservatively high from day 1 and never change it
+  2. Write a batch migration job to re-partition state manually
+  3. Stop job, reprocess from beginning with new partition count
+     (only feasible if Kafka retention covers full history)
+
+Flink's maxParallelism solves this with key groups — the indirection layer
+between key→group and group→task means tasks can change without remapping keys.
 ```
 
 ---
