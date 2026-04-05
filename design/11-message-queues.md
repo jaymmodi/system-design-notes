@@ -159,6 +159,10 @@ consumer.commitSync(); // if crash here, message replayed on restart
 
 ### Exactly-Once (Kafka 0.11+)
 ```java
+// Consumer side — required for exactly-once
+props.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed"); // skip aborted transaction messages
+props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);         // offsets committed via sendOffsetsToTransaction, not auto
+
 // Producer idempotency + transactions
 props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
 props.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, "order-producer-1");
