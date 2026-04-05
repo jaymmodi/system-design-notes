@@ -478,6 +478,13 @@ Adding a new consumer group = new replay from any offset, doesn't affect others.
 
 **Exactly-once in Kafka**:
 ```java
+// ⚠️ IMPORTANT: This pattern only works within a SINGLE JVM process.
+// Both KafkaConsumer and KafkaProducer must be instantiated in the same app
+// (Kafka Streams, Flink job, or your own consumer-transform-producer loop).
+// Exactly-once is NOT possible across separate services or JVMs —
+// there is no distributed transaction boundary across network calls.
+// For cross-service cases, use idempotency keys instead.
+
 // Producer side: idempotent + transactional
 Properties props = new Properties();
 props.put("enable.idempotence", "true");        // dedup retries
@@ -489,10 +496,13 @@ producer.initTransactions();
 producer.beginTransaction();
 try {
     producer.send(new ProducerRecord<>("output-topic", key, value));
-    consumer.commitSync(offsets);           // commit input offset in SAME transaction
-    producer.commitTransaction();
+    // consumer.commitSync() here does NOT commit directly to __consumer_offsets.
+    // It calls sendOffsetsToTransaction() internally — handing the offset to the
+    // producer so both the output write and the offset advance are committed atomically.
+    consumer.commitSync(offsets);
+    producer.commitTransaction();  // both writes land atomically, or neither does
 } catch (Exception e) {
-    producer.abortTransaction();
+    producer.abortTransaction();   // output write rolled back, offset not advanced → safe retry
 }
 // If broker crashes mid-transaction → transaction is atomically aborted on recovery
 ```
@@ -1003,7 +1013,7 @@ Neither alone handles both requirements.
 > Messages are retained regardless — the consumer just has a larger lag. Monitor consumer lag (difference between latest offset and committed offset). If lag grows unboundedly: add more consumers (up to partition count), increase batch size, or optimize processing. If consumer group dies for longer than retention period → data is lost for that group.
 
 **Q: How do you handle duplicate messages in Kafka?**
-> Three layers: (1) Idempotent producers (enable.idempotence=true) dedup retries at broker. (2) Transactional producers atomically commit output + input offset. (3) Consumer-side idempotency: process `eventId` with upsert logic so replaying same message is a no-op. All three together = end-to-end exactly-once.
+> Three layers: (1) Idempotent producers (enable.idempotence=true) dedup retries at broker. (2) Transactional producers atomically commit output + input offset — but only within a single JVM process (Kafka Streams / Flink); exactly-once does NOT extend across separate services or JVMs. (3) Consumer-side idempotency: process `eventId` with upsert logic so replaying same message is a no-op. For cross-service exactly-once, idempotency keys are the only viable approach — there is no distributed transaction boundary across network calls.
 
 **Q: SQS vs Kafka for microservice communication?**
 > SQS: simpler, no infrastructure, natural for task queues, message is consumed once. Kafka: when multiple services need to react to the same event independently, when you need replay for debugging/new service catchup, when events are the source of truth (event sourcing). Rule of thumb: start with SQS, migrate to Kafka when you need fan-out or replay.
