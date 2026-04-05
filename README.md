@@ -33,12 +33,13 @@ system-design-notes/
 │   ├── 22-leases.md
 │   ├── 23-stream-processing.md
 │   ├── 24-observability-operations.md
-│   ├── 25-apache-iceberg-data-lake.md
+│   ├── 25-apache-iceberg-delta-lake.md
 │   ├── 26-netflix-data-platform.md
 │   ├── 27-infrastructure-k8s.md
-│   ├── 28-java-sizes-boe.md          — primitive/object/collection sizes for back-of-envelope
-│   ├── 29-system-design-questions.md — common design questions with thought process + solutions
-│   └── 30-cassandra-vs-dynamodb.md   — deep dive: data model, replication, consistency, ops, cost
+│   ├── 28-java-sizes-boe.md                    — primitive/object/collection sizes for back-of-envelope
+│   ├── 29-system-design-questions.md            — common design questions with thought process + solutions
+│   ├── 30-cassandra-vs-dynamodb.md              — deep dive: data model, replication, consistency, ops, cost
+│   └── 31-dynamodb-key-design-best-practices.md — AWS docs: partition keys, sort keys, GSI/LSI patterns
 │
 ├── data-structures/                  — internals: how storage engines work
 │   ├── 08-bloom-filters.md
@@ -66,7 +67,7 @@ system-design-notes/
 | Core | `design/04-caching.md` | Cache strategies, Redis vs Memcached, EVCache |
 | Core | `design/15-quorum-and-consensus.md` | Replication, consistency models |
 | Core | `design/20-distributed-transactions.md` | Saga, 2PC, workflow orchestration |
-| Deep | `design/25-apache-iceberg-data-lake.md` | Table format, ACID on object storage |
+| Deep | `design/25-apache-iceberg-delta-lake.md` | Table format, ACID on object storage |
 | Deep | `design/26-netflix-data-platform.md` | Kafka, Flink, Iceberg, EVCache, Maestro |
 | Deep | `design/22-leases.md` | Partition ownership, fencing tokens |
 | Supporting | `design/07-replication.md` | Leader-follower vs leaderless |

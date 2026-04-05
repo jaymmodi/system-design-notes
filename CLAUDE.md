@@ -30,6 +30,10 @@ cd coding-samples/src
 javac Main.java && java Main
 ```
 
+## README Maintenance
+
+Always update `README.md` when adding or removing files in `design/`, `java/`, or `data-structures/`. Keep the file listing in README in sync with actual files on disk.
+
 ## Content Style
 
 - Notes are sourced from official documentation (AWS, Kafka docs, etc.) — cite the source URL at the top of new files using the `> Summarized from...` blockquote pattern used in existing files.
