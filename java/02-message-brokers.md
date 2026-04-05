@@ -110,7 +110,7 @@ Persistence: RDB snapshot + AOF (configurable, not as durable as Kafka)
 | **Replay** | No | No | No | Yes (within retention) | Yes (any offset) | Yes (up to MAXLEN) |
 | **Consumer model** | All subscribers get all messages | All subscriptions get pushed | Competing (one gets each msg) | Consumer groups per shard | Independent consumer groups | Consumer groups |
 | **Ordering** | Per channel, FIFO | No (FIFO SNS: per group) | No (FIFO SQS: per group) | Per shard | Per partition | Global (single stream) |
-| **Max TPS (writes)** | ~1M msg/sec (single node) | Standard: ~unlimited; FIFO: 300/sec (3K batched) | Standard: ~unlimited; FIFO: 300/sec (3K batched) | 1K records/sec per shard (1MB/s) | 1M+ msg/sec (cluster) | ~500K msg/sec |
+| **Max TPS (writes)** | ~1M msg/sec (single node) | Standard: ~unlimited; FIFO: 3K MPS default (30K high-throughput) | Standard: ~unlimited; FIFO: 300/sec (3K batched) | 1K records/sec per shard (1MB/s) | 1M+ msg/sec (cluster) | ~500K msg/sec |
 | **Max TPS (reads)** | Broadcast to all simultaneously | Push (no poll) | ~unlimited (Standard); 300/s (FIFO) | 2MB/s per shard (5 reads/sec polling; enhanced fan-out: 2MB/s per consumer) | Limited by partition count × consumer throughput | ~500K msg/sec |
 | **Latency** | <1ms | ~10ms–1s | ~1–10ms | Polling: ~200ms; Enhanced fan-out: ~70ms | ~2–10ms (tunable to ~0.5ms) | <1ms |
 | **Max message size** | 512MB (Redis limit; use <1MB) | 256KB | 256KB | 1MB | 1MB default (configurable to ~10MB) | 512MB (Redis limit) |
@@ -233,14 +233,59 @@ Standard SNS:
   - At-least-once delivery (rare duplicate possible)
   - No ordering guarantee
   - Unlimited TPS
-  - Subscribers: SQS (Standard or FIFO), Lambda, HTTP, Email, SMS, Mobile Push
+  - No storage — pure push, fire-and-forget
+  - Subscribers: SQS (Standard or FIFO), Lambda, HTTP/S, Email, SMS, Mobile Push, Firehose
 
 FIFO SNS:
   - Exactly-once delivery (5-min dedup window by MessageDeduplicationId)
   - Ordered per MessageGroupId (like Kafka partition key)
-  - 300 TPS (3000 with batching)
-  - Subscribers: SQS FIFO ONLY (no Lambda, no HTTP directly)
-  - Use when: order matters and exactly-once matters (financial events, inventory)
+  - Default: 3,000 MPS per topic (raised 10x from 300 in Nov 2023)
+  - High-throughput mode: 30,000 MPS (us-east-1), 9,000 MPS (us-west-2, eu-west-1)
+    → enable with FifoThroughputScope=MessageGroup (trades topic-level dedup for group-level)
+  - Message archiving: stores messages internally up to 365 days (additional cost per GB)
+  - Replay: subscribers set ReplayPolicy with StartingPoint timestamp → SNS replays from archive
+  - Subscribers: SQS queues ONLY (FIFO or Standard) — no Lambda/HTTP/SMS/Email directly
+    → Lambda requires two hops: SNS FIFO → SQS FIFO → Lambda trigger
+  - Use when: order matters AND exactly-once matters (financial events, inventory)
+```
+
+**FIFO catches — biggest gotchas:**
+```
+1. Subscriber restriction: FIFO topics cannot deliver to HTTP/S, SMS, Email, Mobile Push
+   SNS FIFO Topic:
+     ├── SQS FIFO Queue  ✅
+     ├── SQS Standard Queue  ✅
+     ├── HTTP endpoint  ❌  (error at subscription time)
+     ├── SMS / Email    ❌
+     └── Lambda (direct) ❌  → must go through SQS first
+
+2. Immutable type: cannot convert Standard → FIFO topic
+   Migration = create new topic + re-subscribe all consumers + update publisher ARNs
+
+3. MessageGroupId required on every publish
+   Throughput scales with distinct group IDs — single group ID = bottleneck
+
+4. Archiving cost: SNS charges separately for archive storage (on top of SQS/S3 costs)
+   Replay charged as normal deliveries
+```
+
+**S3 event notifications — FIFO not supported:**
+```
+S3 → SNS Standard  ✅
+S3 → SNS FIFO      ❌  (explicitly unsupported)
+S3 → SQS Standard  ✅
+S3 → SQS FIFO      ❌  (explicitly unsupported)
+S3 → Lambda        ✅
+S3 → EventBridge   ✅
+
+Why FIFO wouldn't help anyway: S3 events are at-least-once with no ordering guarantee.
+Enforcing FIFO downstream on an unordered source buys nothing.
+If you need ordering from S3 events: redesign the source, not the queue.
+
+Fan-out patterns with S3:
+  Simple fan-out:      S3 → SNS Standard → SQS Standard queues
+  Routing/filtering:   S3 → EventBridge → multiple SQS / Lambda targets
+  Replay of events:    Re-scan S3 directly — it's already durable storage
 ```
 
 **Filter policies — the killer SNS feature:**
@@ -286,7 +331,8 @@ Why SQS behind SNS (not Lambda directly for all)?
 Message size:    256KB (hard limit — larger payload: store in S3, SNS carries S3 key)
 Subscriptions:   12.5M per topic
 Topics per account: 100K default (soft limit, requestable)
-FIFO TPS:        300/sec (3000 batched) — hard limit, cannot increase
+FIFO TPS:        3,000 MPS default; 30,000 MPS high-throughput (us-east-1)
+                 Enable high-throughput: FifoThroughputScope=MessageGroup
 Standard TPS:    ~unlimited (30M+ messages/sec at AWS scale)
 Delivery retry:  HTTP endpoints: exponential backoff up to 23 times over 23 hours
                  SQS: handled by SQS (not SNS)
