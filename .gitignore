@@ -2,6 +2,9 @@
 out/
 *.class
 
+# Private — local only
+design/24-observability-operations.md
+
 # Private interview prep — local only
 STUDY-PLAN.md
 RESUME-ANALYSIS.md
