@@ -118,3 +118,28 @@ SNS replays matching messages → subscriber endpoint
 - Lambda from FIFO: FIFO → SQS FIFO → Lambda trigger (two hops)
 - Cannot convert topic type; migration requires new topic + re-subscription
 - High-throughput FIFO (30K MPS) requires distributing across many message group IDs
+
+---
+
+## S3 Event Notifications — FIFO Not Applicable
+
+S3 only supports **standard** SNS topics and **standard** SQS queues as event notification destinations. FIFO variants are explicitly unsupported.
+
+| Destination | S3 event notification |
+|---|---|
+| SNS Standard | ✅ |
+| SNS FIFO | ❌ |
+| SQS Standard | ✅ |
+| SQS FIFO | ❌ |
+| Lambda | ✅ |
+| EventBridge | ✅ |
+
+**Why FIFO wouldn't help anyway:** S3 events are delivered *at least once* but with *no ordering guarantee*. Enforcing FIFO downstream on an unordered source buys nothing — you'd just pay FIFO pricing for false ordering.
+
+**If you need ordering from S3 events:** it's not achievable — redesign the source, not the queue.
+
+| Need | Pattern |
+|---|---|
+| Simple fan-out | `S3 → SNS Standard → SQS Standard` |
+| Routing / filtering | `S3 → EventBridge → multiple SQS / Lambda targets` |
+| Replay of events | Re-scan S3 directly — it's already durable storage |
