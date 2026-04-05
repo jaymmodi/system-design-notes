@@ -626,6 +626,172 @@ SNS FIFO + SQS FIFO is the serverless exactly-once fan-out at low volume.
 
 ---
 
+## Fan-Out Pattern: SNS+SQS vs Kafka vs Kinesis
+
+```
+S3 / Producer
+      ↓
+   SNS Topic
+  /    \    \
+SQS1  SQS2  SQS3     ← one queue per subscriber — each processes independently
+ ↓      ↓     ↓
+Svc A  Svc B  Svc C
+```
+
+| Capability | SNS+SQS | Kafka | Kinesis (Enhanced Fan-Out) |
+|-----------|---------|-------|---------------------------|
+| Replay old messages | ❌ once consumed, gone | ✅ replay from any offset | ✅ up to 7 days retention |
+| Message ordering | ❌ best-effort (FIFO queue helps but limited) | ✅ per partition | ✅ per shard |
+| Retention | max 14 days, consumed = deleted | configurable, consumed ≠ deleted | 24h default, up to 7 days |
+| Throughput | SQS standard: nearly unlimited; FIFO: 3000/s | millions/s | 1MB/s write, 2MB/s read per shard |
+| Fan-out | ✅ SNS → multiple SQS queues | ✅ multiple consumer groups | ✅ up to 20 enhanced consumers per stream |
+| Consumer pace independence | ✅ yes | ✅ yes | ✅ yes |
+| Exactly-once | ❌ at-least-once only | ✅ with transactions | ❌ at-least-once only |
+| Delivery model | pull (SQS poll) | pull | push via HTTP/2 (~70ms latency) |
+| Managed service | ✅ fully managed | ❌ self-managed (or MSK) | ✅ fully managed |
+| Checkpointing | SQS visibility timeout | consumer group offsets in Kafka | KCL + DynamoDB table |
+
+> Sources: [SQS quotas](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-quotas.html), [Kinesis enhanced fan-out](https://docs.aws.amazon.com/streams/latest/dev/enhanced-consumers.html)
+
+---
+
+## Kinesis: DynamoDB Checkpointing
+
+KCL (Kinesis Client Library) uses a DynamoDB table to track which shard offset (sequence number) each consumer has processed — one row per shard.
+
+```
+DynamoDB table: "my-app-kinesis-checkpoint"
+┌─────────────────┬──────────────────────────┬───────────────┐
+│ shardId (PK)    │ sequenceNumber           │ leaseOwner    │
+├─────────────────┼──────────────────────────┼───────────────┤
+│ shardId-000000  │ 49590338271490256608559  │ worker-1      │
+│ shardId-000001  │ 49590338271490256608560  │ worker-2      │
+│ shardId-000002  │ 49590338271490256608561  │ worker-1      │
+└─────────────────┴──────────────────────────┴───────────────┘
+
+On crash + restart:
+  KCL reads DynamoDB → finds last sequenceNumber per shard → resumes from there
+  Without DynamoDB: KCL doesn't know where it left off → re-reads from TRIM_HORIZON
+```
+
+Kafka equivalent: offsets stored in `__consumer_offsets` internal topic — no external DB needed.
+
+---
+
+## Kinesis Enhanced Fan-Out: Push via HTTP/2
+
+### Shared throughput (old, polling model):
+```
+Consumer 1 ──GET──→ Kinesis shard   ← polling every 200ms
+Consumer 2 ──GET──→ Kinesis shard   ← same 2MB/s shared between all consumers
+Consumer 3 ──GET──→ Kinesis shard   ← consumers compete for bandwidth
+                    └── 2MB/s total, split across all consumers
+```
+
+### Enhanced fan-out (HTTP/2 push model):
+```
+Kinesis shard ──PUSH──→ Consumer 1  (dedicated 2MB/s, ~70ms latency)
+              ──PUSH──→ Consumer 2  (dedicated 2MB/s, ~70ms latency)
+              ──PUSH──→ Consumer 3  (dedicated 2MB/s, ~70ms latency)
+              └── each consumer gets its OWN 2MB/s pipe, no contention
+```
+
+How the push works:
+```
+1. Consumer calls SubscribeToShard API (HTTP/2 long-lived connection)
+2. Kinesis holds the connection open
+3. New record arrives at shard
+4. Kinesis PUSHES record to all subscribed consumers simultaneously
+5. No polling loop needed — Kinesis initiates delivery
+   ↑ this is why latency drops from 200ms → 70ms (no poll interval wait)
+```
+
+HTTP/2 specifically enables this because it supports **multiplexed streams** — one TCP connection carries data for multiple consumers simultaneously without head-of-line blocking.
+
+---
+
+## Scaling: What Happens When You Add Shards/Partitions?
+
+### Kafka — adding partitions
+
+```
+Before (2 partitions):
+  Partition 0: msg[A, C, E]  → Consumer 1 (owns P0)
+  Partition 1: msg[B, D, F]  → Consumer 2 (owns P1)
+
+After adding Partition 2:
+  Kafka triggers consumer group REBALANCE
+  ┌─────────────────────────────────────────────┐
+  │  All consumers PAUSE processing              │
+  │  Coordinator reassigns partitions            │
+  │  Partition 0 → Consumer 1                   │
+  │  Partition 1 → Consumer 2                   │
+  │  Partition 2 → Consumer 3 (new)             │
+  │  All consumers RESUME                        │
+  └─────────────────────────────────────────────┘
+  Downtime: seconds (stop-the-world rebalance)
+```
+
+**Stateful consumer problem with Kafka repartitioning:**
+```
+Stateful app example: counting orders per user_id (windowed aggregation)
+  Kafka streams user_id to partition via hash(user_id) % numPartitions
+
+Before: hash("user-123") % 2 = partition 1  → Consumer 2 has state for user-123
+After:  hash("user-123") % 3 = partition 0  → Consumer 1 now gets user-123 events
+                                               Consumer 1 has NO state for user-123 ← problem
+
+Effects:
+  - In-memory state (counts, aggregations) is on the wrong consumer
+  - Must rebuild state from scratch by replaying partition history
+  - During rebuild: stale or incorrect results
+  - Kafka Streams handles this via changelog topics (state backed by Kafka)
+    but rebuild still takes time proportional to partition history size
+```
+
+### Kinesis — resharding (split/merge)
+
+```
+Before (2 shards):
+  Shard 0: partitionKey hash range [0, 50%]    → Consumer A
+  Shard 1: partitionKey hash range [50%, 100%] → Consumer B
+
+Split Shard 0 into Shard 2 + Shard 3:
+  Shard 0: CLOSED (still readable for 7 days, but no new writes)
+  Shard 2: hash range [0, 25%]   → Consumer A (or new consumer)
+  Shard 3: hash range [25%, 50%] → Consumer B (or new consumer)
+
+  KCL handles this automatically:
+    1. Detects parent shard (Shard 0) is CLOSED
+    2. Finishes processing Shard 0
+    3. Starts reading child shards (Shard 2, Shard 3)
+    4. Updates DynamoDB checkpoint with new shard IDs
+```
+
+**Stateful consumer problem with Kinesis resharding:**
+```
+Same issue: state was accumulated per shard
+  Shard 0 consumer had: {user-123: 50 orders, user-456: 30 orders}
+  After split:
+    Shard 2 consumer gets user-123 events → no prior state
+    Shard 3 consumer gets user-456 events → no prior state
+  Must rebuild from closed parent shard or accept state reset
+```
+
+### Mitigations for stateful scaling
+
+| Strategy | How | Tradeoff |
+|----------|-----|----------|
+| External state store | Store state in Redis/DynamoDB keyed by entity ID, not partition | Extra latency on every read/write |
+| Kafka Streams changelog | State backed by compacted Kafka topic, restored on reassignment | Rebuild time on rebalance |
+| Sticky partitioning | Don't repartition — scale consumers vertically first | Limited scalability |
+| Cooperative rebalancing (Kafka) | Only reassign partitions that need to move, others keep running | Kafka 2.4+ only, reduces pause |
+| Accept stateless + idempotent | Recompute from scratch, make processing idempotent | Only works for short windows |
+
+**Key interview point:** adding partitions/shards is NOT free for stateful apps. The routing key (partition key / message key) determines which consumer owns which data. Changing the number of partitions changes the routing — state built on old routing is now on the wrong node.
+
+---
+
 ## Netflix Angle (Keystone Pipeline)
 
 Netflix's event streaming architecture:
