@@ -719,6 +719,224 @@ Rule of thumb: if latency requirement < 10 seconds → Flink. Otherwise → Spar
 
 ---
 
+---
+
+## Spark 4.0 Structured Streaming — What Changed
+
+> Spark 4.0 (released 2025) is the most significant Structured Streaming release since Spark 2.0 added the API. The headline: Spark now has a real stateful streaming API (`TransformWithState`) that competes directly with Flink's `KeyedProcessFunction`. Here's what changed and how it shifts the Spark vs Flink decision.
+
+---
+
+### 1. TransformWithState — Spark's Answer to Flink's KeyedProcessFunction
+
+The old API (`flatMapGroupsWithState`) was limited: one state variable per group, no timers, no multiple state types. Spark 4.0 replaces it with `TransformWithState`, which introduces **arbitrary state** — multiple state variables, multiple column families, timers, TTL, and list/map state.
+
+```python
+# Spark 4.0: TransformWithState (Python)
+# Before: flatMapGroupsWithState — one state variable, rigid
+# Now: full stateful processor with multiple state variables + timers
+
+class FraudDetectionProcessor(StatefulProcessor):
+    def init(self, handle: StatefulProcessorHandle) -> None:
+        # Multiple named state variables per key (like Flink's ValueState/MapState)
+        self.flag_state = handle.getValueState("flag", schema)
+        self.profile_state = handle.getMapState("profile", key_schema, value_schema)
+        self.timer_state = handle.getListState("timers", schema)
+
+    def handleInputRows(self, key, rows, timer_values) -> Iterator[pd.DataFrame]:
+        flag = self.flag_state.get()
+        for row in rows:
+            if row["amount"] > 1000:
+                self.flag_state.update(True)
+                # Register timer — fires after 1 hour (like Flink's timerService)
+                self.handle.registerTimer(currentMs + 3_600_000)
+            if flag and row["amount"] < 1.0:
+                yield pd.DataFrame({"alert": ["Suspicious pattern"]})
+
+    def handleExpiredTimer(self, key, timer_values) -> Iterator[pd.DataFrame]:
+        # Called when timer fires — clear state (identical pattern to Flink)
+        self.flag_state.clear()
+        return iter([])
+
+df.groupBy("account_id").transformWithState(
+    FraudDetectionProcessor(),
+    outputStructType,
+    TimeMode.ProcessingTime()
+)
+```
+
+**How this compares to Flink:**
+```
+Flink KeyedProcessFunction          Spark 4.0 TransformWithState
+─────────────────────────────────   ────────────────────────────────
+ValueState<T>                   →   handle.getValueState("name", schema)
+MapState<K, V>                  →   handle.getMapState("name", k_schema, v_schema)
+ListState<T>                    →   handle.getListState("name", schema)
+timerService().registerTimer()  →   handle.registerTimer(timestamp)
+onTimer()                       →   handleExpiredTimer()
+TTL via StateTtlConfig          →   TTL per state variable (ListState TTL: SPARK-49744)
+```
+
+The API is almost isomorphic. The key difference: Flink's state lives in RocksDB natively since Flink 1.x; Spark's RocksDB state backend was added in Spark 3.2 and is now the default for `TransformWithState`.
+
+---
+
+### 2. State Data Source — Spark's Unique Advantage
+
+Flink has **no built-in way to query state at rest**. To debug Flink state you need custom tooling or read checkpoints directly. Spark 4.0 adds a first-class **State Data Source** — you can read any streaming operator's state as a DataFrame:
+
+```python
+# Read state as a batch DataFrame — unique to Spark, Flink has no equivalent
+state_df = spark.read.format("statestore") \
+    .option("path", "/checkpoint/stateful-query") \
+    .option("batchId", 42) \
+    .option("operatorId", 0) \
+    .load()
+
+state_df.show()
+# +──────────────+──────────────────+──────────────+
+# | account_id   | flag             | last_updated |
+# +──────────────+──────────────────+──────────────+
+# | acc-123      | true             | 1712345678   |
+
+# Change Feed Reader — see what changed between batches (like CDC for state)
+changes_df = spark.read.format("statestore") \
+    .option("readChangeFeed", "true") \
+    .option("startBatchId", 40) \
+    .load()
+# Shows: which keys were updated/deleted between batch 40 and now
+```
+
+**Why this matters:** production debugging of stateful streaming jobs is notoriously hard. State Data Source lets you answer "what is the state for key X right now?" without stopping the job. This is a genuine operational advantage over Flink.
+
+---
+
+### 3. maxBytesPerTrigger — Better Backpressure Control
+
+```python
+# Spark 4.0: cap how much data is processed per micro-batch
+df = spark.readStream.format("kafka") \
+    .option("maxBytesPerTrigger", "100mb") \  # NEW in 4.0
+    .option("maxOffsetsPerTrigger", 10000) \   # existed before
+    .load()
+```
+
+Previously you could only limit by record count. Byte-based limits are more predictable for variable-size messages (e.g., a batch of 10K 1MB messages is very different from 10K 1KB messages).
+
+---
+
+### 4. RocksDB Improvements
+
+```
+Spark 4.0 RocksDB state backend:
+  - Configurable compression (SPARK-45503) — LZ4, Snappy, Zstd
+  - fallocate() can be disabled (SPARK-45415) — important for cloud storage
+  - Virtual Column Families (SPARK-48742) — separate RocksDB column family per state variable
+    → avoids key collisions between state variables; matches how Flink organizes RocksDB
+  - Schema evolution for state (SPARK-50714) — add/remove fields from state schema without full replay
+```
+
+---
+
+### 5. Schema Evolution for State
+
+Previously: changing your state schema required wiping state and replaying from scratch. Spark 4.0 adds `StateSchemaV3` and Avro encoding for `TransformWithState` — you can evolve the state schema across versions.
+
+Flink handles this via `TypeInformation` compatibility checks + manual migration code. Spark 4.0's approach (Avro-based schema registry integration) is arguably cleaner.
+
+---
+
+### Updated Comparison: Spark 4.0 vs Flink
+
+| Dimension | Spark 4.0 Structured Streaming | Flink |
+|-----------|-------------------------------|-------|
+| **Processing model** | Micro-batch (default); Continuous mode (experimental) | True streaming (event-driven) |
+| **Latency** | ~100ms–seconds (trigger interval) | Milliseconds |
+| **Stateful API** | `TransformWithState` — multiple state vars, timers, TTL | `KeyedProcessFunction` — same capabilities, mature |
+| **State backend** | RocksDB (Spark 3.2+, improved in 4.0) | RocksDB (first-class since Flink 1.x) |
+| **State debugging** | State Data Source — query state as DataFrame ✅ | No native state query — external tooling needed ❌ |
+| **State schema evolution** | Avro-based, built-in (Spark 4.0) ✅ | Manual `TypeInformation` compat + migration code |
+| **Checkpointing** | All-or-nothing (full checkpoint) | Incremental Chandy-Lamport (only changed blocks) |
+| **Exactly-once** | Yes (idempotent writes + WAL) | Yes (2PC, end-to-end, more sinks supported) |
+| **Watermarks** | `withWatermark()` — simpler | First-class, per-partition, idle source handling |
+| **Backpressure** | `maxBytesPerTrigger` + PID controller | Automatic credit-based, no config needed |
+| **Batch + stream unification** | Unified SparkSession — same code runs batch or stream | Table API unifies batch/stream; less mature |
+| **Python support** | First-class PySpark, `TransformWithStateInPandas` | PyFlink — improving but still behind PySpark |
+| **SQL support** | Spark SQL — best-in-class | Flink SQL — very good, but Spark SQL is richer |
+| **Ecosystem** | Delta Lake, Iceberg, Hudi, MLlib, pandas | Iceberg, Kafka, fewer native connectors |
+| **Operational tooling** | State Data Source, Spark UI, history server | Flink Web UI, checkpoint browser |
+| **Scaling** | Restart required for parallelism change | Rescaling with state redistribution (Flink 1.17+) |
+| **Netflix use** | Batch, backfill, Iceberg compaction | Real-time streaming (20K+ jobs) |
+
+---
+
+### Where Flink Still Wins
+
+```
+1. Latency: Flink is milliseconds; Spark 4.0 micro-batch is still seconds minimum
+   → If you need sub-second latency, Flink is the only answer
+
+2. Checkpointing: Flink's incremental Chandy-Lamport is faster and more reliable
+   for large state. Spark's full checkpoint is still the bottleneck for big state jobs.
+
+3. True streaming semantics: event-time windowing, per-partition watermarks,
+   idle source detection — Flink has had these since 2016, Spark's are still simpler.
+
+4. Rescaling without restart: Flink 1.17+ can redistribute keyed state to a new
+   parallelism without stopping the job. Spark requires a restart.
+
+5. Exactly-once breadth: Flink's 2PC works with more sink types out of the box.
+```
+
+### Where Spark 4.0 Closes the Gap (or Wins)
+
+```
+1. State debugging: State Data Source is a genuine advantage — query live state
+   as a DataFrame, read change feeds, inspect specific batch snapshots.
+   Flink has nothing comparable built-in.
+
+2. Python: TransformWithStateInPandas brings the full stateful API to Python.
+   PyFlink is still catching up.
+
+3. SQL richness: Spark SQL is more mature for complex analytics on streaming data.
+
+4. Batch/stream unification: Spark's unified model is more production-proven.
+   Same code, same API, same optimizations whether batch or stream.
+
+5. Ecosystem: Delta Lake, MLlib, pandas UDFs — if you're in the Spark ecosystem,
+   4.0 makes it much harder to justify switching to Flink for stateful jobs.
+
+6. State schema evolution: Avro-based schema evolution in 4.0 is cleaner than
+   Flink's manual migration approach.
+```
+
+### When to Choose Each (Updated for 2025)
+
+```
+Choose Flink when:
+  → Latency < 1 second is required (Flink is the only real option)
+  → Very large stateful jobs where incremental checkpointing matters
+  → You need fine-grained watermark control (per-partition, idle handling)
+  → You're already on the Flink ecosystem (Kafka-native)
+
+Choose Spark 4.0 Structured Streaming when:
+  → You're already on Spark / Databricks / EMR
+  → Python is your primary language (PySpark >> PyFlink)
+  → Latency of seconds is acceptable (most analytics use cases)
+  → You need production state debugging (State Data Source)
+  → You need Spark SQL richness on streaming data
+  → Batch + stream unified codebase is important
+  → Delta Lake / Iceberg writes with ACID guarantees
+
+The honest answer for most data platform teams in 2025:
+  Spark 4.0 has closed the stateful streaming gap enough that the choice
+  is now primarily driven by ecosystem (already using Spark?) and latency
+  requirements (< 1s → Flink, seconds → Spark). The "Flink for everything
+  streaming" default no longer holds.
+```
+
+---
+
 ### The Bridge (Jay's Interview Answer)
 
 > "I ran Spark Streaming at 200 billion events per hour at GuardDuty. I hit Spark's fundamental limitations directly — specifically the checkpointing model for stateful processing. When a checkpoint partially failed, we had data loss. My solution was to externalize state to DynamoDB with conditional writes, which gave us independent durability and scalability — but at the cost of network round trips per event.
