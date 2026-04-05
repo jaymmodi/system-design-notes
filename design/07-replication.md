@@ -513,8 +513,8 @@ Node D is down during write (W=QUORUM, N=3):
 ```
 Read with QUORUM (reads 2 replicas):
 
-  Node B → {name: "Jay", version: 5}
-  Node C → {name: "Jay", version: 4}  ← stale
+  Node B → {name: "Alice", version: 5}
+  Node C → {name: "Alice", version: 4}  ← stale
 
   Coordinator returns version 5 to client (latest wins)
   Background: writes version 5 back to Node C asynchronously

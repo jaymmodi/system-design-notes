@@ -345,7 +345,7 @@ Key decisions:
 
 ## Iceberg vs Delta Lake — Deep Comparison
 
-> **Jay's context**: You know Delta Lake from GuardDuty. This section is your bridge. The concepts are nearly identical — the differences are in the details that interviewers probe.
+> **Context**: If you know Delta Lake from GuardDuty, this section is your bridge. The concepts are nearly identical — the differences are in the details that interviewers probe.
 
 ### The 30-Second Summary
 Both solve the same problem: ACID transactions and schema evolution on a data lake (S3/GCS/ADLS). Delta Lake is Databricks' solution; Iceberg is the open standard adopted by Netflix, Apple, Snowflake, and the broader community.
@@ -503,6 +503,6 @@ spark.read.format("delta")
 
 ---
 
-### The Bridge (Jay's Interview Answer)
+### The Bridge (Sample Interview Answer)
 
 > "I've used Delta Lake extensively at GuardDuty for stateful detection pipelines. Delta Lake and Iceberg solve the same core problem — ACID semantics on object storage — and share the same key concepts: snapshots, schema evolution, time travel, and optimistic concurrency control. The main advantages Iceberg has that are relevant to Netflix specifically are: partition evolution without data rewrite, stronger multi-engine support (Flink + Trino + Spark all reading the same tables), and the IPS pattern for zero-copy incremental processing. The API is different but the mental model transfers directly."

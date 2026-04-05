@@ -5,7 +5,7 @@
 Traditional B-tree storage engines do **random writes** — updating a value means seeking to the exact page on disk and modifying it in place.
 
 ```
-B-tree write "user:123 → Jay":
+B-tree write "user:123 → Alice":
   1. Find the leaf page on disk (random seek — slow on HDD, expensive on SSD)
   2. Modify the page in place
   3. Write back to disk (random write)

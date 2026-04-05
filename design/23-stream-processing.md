@@ -727,7 +727,7 @@ public class DeduplicateFunction extends KeyedProcessFunction<String, Event, Eve
 
 ## Flink vs Spark — Deep Comparison
 
-> **Jay's context**: You know Spark Streaming deeply from GuardDuty. This section is your bridge. You've already lived the pain points that motivated Flink's design.
+> **Context**: If you know Spark Streaming deeply from GuardDuty, this section is your bridge. The pain points that motivated Flink's design map directly to real production issues.
 
 ### The 30-Second Summary
 Spark was built for batch first, streaming was added later (micro-batch model). Flink was built for streaming first — events are processed one at a time as they arrive. This fundamental difference drives every trade-off below.
@@ -1221,7 +1221,7 @@ The honest answer for most data platform teams in 2025:
 
 ---
 
-### The Bridge (Jay's Interview Answer)
+### The Bridge (Sample Interview Answer)
 
 > "I ran Spark Streaming at 200 billion events per hour at GuardDuty. I hit Spark's fundamental limitations directly — specifically the checkpointing model for stateful processing. When a checkpoint partially failed, we had data loss. My solution was to externalize state to DynamoDB with conditional writes, which gave us independent durability and scalability — but at the cost of network round trips per event.
 >
