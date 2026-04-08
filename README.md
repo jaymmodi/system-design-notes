@@ -39,7 +39,8 @@ system-design-notes/
 │   ├── 28-java-sizes-boe.md                    — primitive/object/collection sizes for back-of-envelope
 │   ├── 29-system-design-questions.md            — common design questions with thought process + solutions
 │   ├── 30-cassandra-vs-dynamodb.md              — deep dive: data model, replication, consistency, ops, cost
-│   └── 31-dynamodb-key-design-best-practices.md — AWS docs: partition keys, sort keys, GSI/LSI patterns
+│   ├── 31-dynamodb-key-design-best-practices.md — AWS docs: partition keys, sort keys, GSI/LSI patterns
+│   └── 32-dynamodb-transactions.md              — TransactWriteItems/GetItems, serializability, linearizability, isolation levels, Java examples
 │
 ├── data-structures/                  — internals: how storage engines work
 │   ├── 08-bloom-filters.md
