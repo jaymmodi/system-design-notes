@@ -284,17 +284,90 @@ putItem(PK, value)           // may overwrite the other process's write
 | Read → modify → write (in app code) | No — gap between read and write | Yes → use `ConditionExpression` |
 | Counter increment | Yes — use `ADD` expression | No |
 
-**Fix for read-modify-write:** Add a `ConditionExpression` that checks the value you read is still current. If another writer changed it between your read and write, DynamoDB throws `ConditionalCheckFailedException` → retry.
+---
+
+## Concurrency Control Strategies
+
+### 1. Optimistic Locking (Optimistic Concurrency Control)
+
+**Assumption:** Conflicts are rare — let concurrent access happen, detect conflict at write time.
+
+**Mechanism:** Store a `version` attribute on the item. Increment it on every write. Guard each write with a `ConditionExpression` that checks the version you read is still current.
 
 ```java
 // Read: version = 4
-// Write with guard:
 updateItem(
-  conditionExpression: "version = :readVersion",   // fails if already incremented
-  updateExpression:    "SET version = :newVersion"
+  conditionExpression: "version = :readVersion",   // fails if someone else already wrote
+  updateExpression:    "SET #data = :newData, version = :newVersion",
+  expressionAttributeValues: {
+    ":readVersion": 4,
+    ":newVersion":  5,
+    ":newData":     "..."
+  }
 )
 // ConditionalCheckFailedException → retry from read
 ```
+
+**Best for:**
+- Low contention (conflicts are rare)
+- Single-item updates
+- Cheap retries (short operations)
+
+---
+
+### 2. Pessimistic Locking — Transactions (`TransactWriteItems`)
+
+**Assumption:** Conflicts matter — use DynamoDB's native transactions for all-or-nothing semantics.
+
+**Mechanism:** Wrap reads and writes in `TransactWriteItems` / `TransactGetItems`. DynamoDB ensures atomicity across multiple items/tables.
+
+**Best for:**
+- Multi-item atomic updates (e.g. deduct inventory + create order)
+- All-or-nothing semantics
+- Moderate contention
+
+**Cost:** 2× WCU per item (prepare + commit phase).
+
+---
+
+### 3. Pessimistic Locking — Lock Client (Dedicated Lock Table)
+
+**Assumption:** Conflicts are frequent or retries are expensive — acquire exclusive access before modifying.
+
+**Mechanism:** Maintain a separate DynamoDB lock table. Process acquires a lease (with TTL) before doing work. Other processes see the lock and wait. Heartbeat keeps the lock alive. Lock auto-expires if process crashes.
+
+```
+Lock table item:
+  PK: "lock:resource123"
+  owner: "process-A"
+  ttl: <expiry timestamp>    ← auto-released if process crashes
+
+Process B tries to acquire:
+  PutItem with condition: attribute_not_exists(PK)
+  → fails if Process A holds it → wait and retry
+```
+
+**Best for:**
+- Long-running workflows
+- Coordinating access to external resources
+- Expensive retries (you don't want to redo work)
+- Distributed coordination across services
+
+---
+
+### Strategy Comparison
+
+| Strategy | Assumption | Best For | Cost |
+|----------|------------|----------|------|
+| **Optimistic locking** | Conflicts rare | Single-item, cheap retries, low contention | Normal WCU |
+| **Transactions** | Need atomicity | Multi-item all-or-nothing, moderate contention | 2× WCU |
+| **Lock client** | Conflicts likely / retries expensive | Long workflows, external resources, distributed coordination | Extra lock table WCU |
+
+---
+
+### ⚠️ Global Tables Warning
+
+Optimistic locking with version numbers **does not work across DynamoDB global tables**. Global tables use **last writer wins** reconciliation — a write in us-east-1 can silently overwrite a concurrent write in eu-west-1 without version checks. Handle conflicts at the application level when using global tables.
 
 ---
 
