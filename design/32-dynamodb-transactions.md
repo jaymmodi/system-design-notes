@@ -261,6 +261,43 @@ TransactGetItemsResponse response = client.transactGetItems(getRequest);
 
 ---
 
+## Atomicity of Individual Operations vs Locking
+
+**Individual write operations (`UpdateItem`, `PutItem`, `DeleteItem`) are always atomic** — they operate on the most recent version of the item regardless of concurrency. No locking needed for single-item writes.
+
+**Locking is only needed for read-modify-write cycles:**
+
+```
+// SAFE — atomic, no locking needed
+updateItem(PK, "SET counter = counter + 1")   // ADD expression, atomic
+
+// UNSAFE — race condition without locking
+value = getItem(PK)          // another process can modify here
+value.counter += 1           //
+putItem(PK, value)           // may overwrite the other process's write
+```
+
+| Operation | Atomic? | Locking needed? |
+|-----------|---------|-----------------|
+| `UpdateItem` (expression-based) | Yes — always latest version | No |
+| `PutItem` / `DeleteItem` | Yes | No |
+| Read → modify → write (in app code) | No — gap between read and write | Yes → use `ConditionExpression` |
+| Counter increment | Yes — use `ADD` expression | No |
+
+**Fix for read-modify-write:** Add a `ConditionExpression` that checks the value you read is still current. If another writer changed it between your read and write, DynamoDB throws `ConditionalCheckFailedException` → retry.
+
+```java
+// Read: version = 4
+// Write with guard:
+updateItem(
+  conditionExpression: "version = :readVersion",   // fails if already incremented
+  updateExpression:    "SET version = :newVersion"
+)
+// ConditionalCheckFailedException → retry from read
+```
+
+---
+
 ## When to Use Transactions vs Alternatives
 
 | Scenario | Use |
