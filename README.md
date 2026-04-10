@@ -56,10 +56,23 @@ system-design-notes/
 
 ---
 
+## Interview Delivery Framework
+
+| File | Purpose |
+|------|---------|
+| `SYSTEM-DESIGN-DELIVERY.md` | Step-by-step flow diagram for every system design round (Requirements → Entities → API → High-Level → Deep Dive) |
+| `SYSTEM-DESIGN-CORE-CONCEPTS.md` | Core concepts cheat sheet: networking, caching, sharding, CAP, consistent hashing, numbers to know |
+| `NETFLIX-INTERVIEW-GUIDE.md` | Netflix-specific preparation guide |
+| `NETFLIX-POPULAR-QUESTIONS.md` | Common Netflix system design questions |
+| `STUDY-PLAN.md` | Study schedule and priorities |
+
+---
+
 ## Design Topics
 
 | Priority | File | Topic |
 |----------|------|-------|
+| Core | `design/33-dynamo-dynamodb-dsql.md` | Dynamo vs DynamoDB vs Aurora DSQL — architecture, consistency, multi-region, DSQL internals |
 | Core | `design/02-cap-theorem.md` | Consistency vs availability tradeoffs |
 | Core | `design/03-consistent-hashing.md` | Sharding, KV stores, Kafka partitioning |
 | Core | `design/23-stream-processing.md` | Kafka, Flink, exactly-once semantics |
