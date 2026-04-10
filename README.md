@@ -40,7 +40,12 @@ system-design-notes/
 │   ├── 29-system-design-questions.md            — common design questions with thought process + solutions
 │   ├── 30-cassandra-vs-dynamodb.md              — deep dive: data model, replication, consistency, ops, cost
 │   ├── 31-dynamodb-key-design-best-practices.md — AWS docs: partition keys, sort keys, GSI/LSI patterns
-│   └── 32-dynamodb-transactions.md              — TransactWriteItems/GetItems, serializability, linearizability, isolation levels, Java examples
+│   ├── 32-dynamodb-transactions.md              — TransactWriteItems/GetItems, serializability, concurrency control strategies, fencing
+│   └── 33-dynamo-dynamodb-dsql.md               — Dynamo vs DynamoDB vs Aurora DSQL: durability, consistency, DSQL internals
+│
+├── practice-questions/               — coding and design practice
+│   ├── concurrency-coding-questions.md
+│   └── java-concurrency-refresher.md
 │
 ├── data-structures/                  — internals: how storage engines work
 │   ├── 08-bloom-filters.md
@@ -84,6 +89,9 @@ system-design-notes/
 | Deep | `design/22-leases.md` | Partition ownership, fencing tokens |
 | Supporting | `design/07-replication.md` | Leader-follower vs leaderless |
 | Supporting | `design/27-infrastructure-k8s.md` | Kubernetes, service mesh |
+| Deep | `design/30-cassandra-vs-dynamodb.md` | Data model, replication, consistency, ops, cost comparison |
+| Deep | `design/31-dynamodb-key-design-best-practices.md` | Partition keys, sort keys, GSI/LSI patterns, version control |
+| Deep | `design/32-dynamodb-transactions.md` | TransactWriteItems, concurrency control, optimistic locking, fencing |
 
 ---
 
@@ -121,3 +129,6 @@ Know well enough to explain and compare:
 | Handle partial failures | Circuit Breaker (Hystrix) |
 | Partition ownership | Leases + fencing tokens |
 | Producer-consumer backpressure | ArrayBlockingQueue + Virtual Threads |
+| Multi-region active-active SQL | Aurora DSQL |
+| Multi-region active-active NoSQL | DynamoDB Global Tables (MREC) |
+| Distributed lock with fencing | DynamoDB lock client + conditional writes |
